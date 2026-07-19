@@ -139,13 +139,13 @@ class OakD(object):
 
         cam_rgb.setResolution(res)
         # Set preview size to match model input
-        cam_rgb.setPreviewSize(self.image_w, self.image_h)
+        cam_rgb.setPreviewSize(self.width, self.height)
         cam_rgb.setInterleaved(False)
 
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
 
-        cam_rgb.video.link(xout_rgb.input)
+        cam_rgb.preview.link(xout_rgb.input)
 
     def get_mono_camera(self, pipeline: Pipeline, is_left: bool):
         # Configure mono camera
@@ -189,20 +189,17 @@ class OakD(object):
         #
         # convert camera frames to images
         #
-        if self.enable_rgb or self.enable_depth:
-
+        if self.enable_depth:
             self.depth_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 name="depth", maxSize=1, blocking=False
             )
+            self.depth_image = self.get_frame(self.depth_queue)
+
+        if self.enable_rgb:
             self.rgb_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 "rgb", maxSize=1, blocking=False
             )
-
-            depth_frame = self.get_frame(self.depth_queue)
-            rgb_frame = self.get_frame(self.rgb_queue)
-
-            self.depth_image = depth_frame
-            self.color_image = rgb_frame
+            self.color_image = self.get_frame(self.rgb_queue)
 
         if self.resize:
             if self.width != WIDTH or self.height != HEIGHT:
