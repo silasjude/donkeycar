@@ -559,6 +559,15 @@ CV_CONTROLLER_INPUTS = ['cam/image_array']
 CV_CONTROLLER_OUTPUTS = ['pilot/steering', 'pilot/throttle', 'cv/image_array']
 CV_CONTROLLER_CONDITION = "run_pilot"
 
+# Alternative: donkeycar.parts.line_follower_multiband.LineFollowerMultiBand.
+# Detects in CIELAB instead of HSV and scans multiple horizontal bands instead
+# of one slice, which tends to help with dashed/segmented lines and unstable
+# lighting. Its own tunables (LF_LAB_*, LF_HUE_*, LF_STEER_*, ...) are
+# documented in that file and all have built-in defaults, so no further keys
+# below are required to use it. To switch:
+#   CV_CONTROLLER_MODULE = "donkeycar.parts.line_follower_multiband"
+#   CV_CONTROLLER_CLASS = "LineFollowerMultiBand"
+
 # LineFollower - line color and detection area
 SCAN_Y = 100          # num pixels from the top to start horiz scan
 SCAN_HEIGHT = 20      # num pixels high to grab from horiz scan

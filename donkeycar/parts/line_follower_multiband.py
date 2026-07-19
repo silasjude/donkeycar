@@ -1,39 +1,47 @@
 #!/usr/bin/env python3
 """
-line_following.py — DonkeyCar Track 2, Mission 1: follow the yellow hashed line.
+line_follower_multiband.py — multi-band CV line follower.
 
-Written from scratch. Replaces donkeycar/parts/line_follower.py, which fails on
-this track for two reasons:
+An alternative to donkeycar/parts/line_follower.py's single-slice HSV
+detector, aimed at dashed/segmented lines and lighting that isn't stable
+enough for one fixed HSV range. Two differences:
 
-  1. Its HSV threshold (H 0-50, S>50, V>50) matches the warm night lighting:
-     the concrete, orange cones, and wall reflections all read as "yellow".
-     Worse, HSV saturation of the tape swings from ~160 (night, warm lights)
-     to ~87 (daylight) — no fixed HSV range covers both. This detector works
-     in CIELAB instead: measured across day/sun/shadow/night photos of this
-     track, the tape's b-channel (yellowness) stays at ~145-149 while
-     concrete <=139, white tape ~135, blue tape ~98; the a-channel rejects
-     the orange cones.
-  2. It samples ONE thin horizontal slice of the image. The center line is
-     DASHED, so the slice regularly lands in a gap between dashes, detection
-     drops out, and the car drifts off with stale steering.
+  1. Detection runs in CIELAB instead of HSV. A line's color is identified by
+     LAB b-channel (yellowness/blueness) and a-channel (greenness/redness)
+     thresholds plus an HSV hue guard, all configurable — see LF_LAB_* /
+     LF_HUE_* below. LAB tends to separate a taped line from background
+     (pavement, vegetation, cones) more robustly across day/shadow/artificial
+     lighting than HSV alone, whose saturation channel in particular can swing
+     widely between daylight and warm artificial light. The bundled defaults
+     were tuned for a yellow dashed line; expect to recalibrate LF_LAB_*/
+     LF_HUE_* for a different line color or surface using the offline test
+     harness below.
+  2. It samples a tall region (bottom LF_ROI_TOP..1.0 of the frame) split into
+     horizontal bands, finds the line centroid in each band, and fits a line
+     through them, instead of one thin horizontal slice. This tolerates
+     dashed/segmented lines (a single-slice detector regularly lands in a gap
+     between dashes) and additionally yields line heading, not just lateral
+     offset.
 
-This detector instead scans a tall region (the bottom ~55% of the frame) split
-into horizontal bands, finds the line centroid in each band, and fits a line
-through them. That gives both lateral offset AND line heading, works across
-dash gaps, and coasts on last-known steering (then stops) when the line is lost.
+On losing the line it coasts on last-known steering for a grace period, then
+stops — by design it never blind-turns, since a turn applied blind just
+traces a circle for the rest of the grace window.
 
---- HOW TO RUN ON THE CAR (drop-in, no framework changes) -------------------
-1. Copy this file into your car directory (e.g. ~/mycar/line_following.py).
-2. In ~/mycar/myconfig.py set:
-       CV_CONTROLLER_MODULE = "line_following"
-       CV_CONTROLLER_CLASS  = "LineFollower"
-3. Drive as usual:  python manage.py drive   (cv_control template)
-   Switch the web UI to "Local Pilot (d)" mode to engage the follower.
+--- HOW TO USE ---------------------------------------------------------------
+In myconfig.py, point the cv_control template at this part:
+    CV_CONTROLLER_MODULE = "donkeycar.parts.line_follower_multiband"
+    CV_CONTROLLER_CLASS  = "LineFollowerMultiBand"
+Then drive as usual:  python manage.py drive   (cv_control template)
+Switch the web UI to "Local Pilot (d)" mode to engage the follower. Every
+tunable below can be overridden from myconfig.py; the part runs on the
+built-in defaults even with a bare/minimal cfg.
 
 --- HOW TO TEST OFF THE CAR (no hardware needed) ----------------------------
-   python line_following.py test <image_or_video_or_folder> [--out overlay_dir]
+   python line_follower_multiband.py test <image_or_video_or_folder> [--out overlay_dir]
 This runs the exact same pipeline on saved frames and writes overlay images
-showing the mask, detected centroids, fitted line, and steering output.
+showing the mask, detected centroids, fitted line, and steering output. Use
+this to (re)calibrate LF_LAB_*/LF_HUE_* against photos of your own line/track
+before trusting it on hardware.
 -----------------------------------------------------------------------------
 """
 
@@ -52,30 +60,47 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 DEFAULTS = dict(
     # --- color detection (CIELAB) ---
-    # Detection runs in LAB space, not HSV. Measured from track photos in
-    # sunlight, shadow, AND at night, the tape's b-channel (yellowness) is
-    # stable at ~145-149 while concrete is <=139, white tape ~135, blue tape
-    # ~98. HSV saturation is NOT stable (daytime tape drops to S~87). The
-    # a-channel guard rejects the orange cones (a~164 vs tape ~125).
-    LF_LAB_B_MIN=143,       # min yellowness; raise if concrete leaks through
-    LF_LAB_A_MAX=142,       # max redness; rejects cones/flowers
+    # Detection runs in LAB space, not HSV, because HSV saturation of a taped
+    # line tends to swing a lot between daylight and warm artificial light,
+    # while LAB b-channel (yellowness) stays comparatively stable. Values
+    # below are a starting point tuned for a yellow line on light pavement;
+    # recalibrate against your own track photos with the offline test
+    # harness (see module docstring) before trusting them on hardware.
+    LF_LAB_B_MIN=143,       # min yellowness; raise if background leaks through
+    LF_LAB_A_MAX=142,       # max redness; rejects orange/red obstacles
     LF_LAB_L_MIN=40,        # min lightness; rejects near-black noise
 
-    # Hue guard: kills VEGETATION, which passes the LAB yellowness test.
-    # Measured from drive video: sunlit grass/plants are H 34-46, the tape is
-    # H 18-28 in all lighting (day/shadow/night). OpenCV hue, 0-179.
+    # Hue guard: an extra check to reject false positives (e.g. vegetation)
+    # that can pass the LAB yellowness test. OpenCV hue, 0-179. Defaults
+    # below target yellow; widen/shift for a different line color.
     LF_HUE_MIN=10,
     LF_HUE_MAX=32,
 
+    # Saturation floor: HSV hue is undefined/noisy for near-gray pixels (a
+    # small RGB channel imbalance from compression or sensor noise can swing
+    # hue anywhere), so bright achromatic surfaces -- white boundary tape,
+    # washed-out pavement -- can pass the hue gate above by pure noise. This
+    # rejects them before hue is trusted. Keep it well below the true line
+    # color's saturation but comfortably above white/gray's; unlike the hue
+    # and LAB values, this doesn't need retuning per lighting condition since
+    # it's separating "has real color" from "is essentially gray," not
+    # measuring the color itself.
+    LF_HSV_S_MIN=35,
+
     # --- region of interest ---
     LF_ROI_TOP=0.62,        # ignore everything above this fraction of the image.
-                            # The camera is mounted high/level: the horizon sits
-                            # ~55% down the frame, planters/bushes right above
-                            # it. Only the bottom ~38% is reliably track.
+                            # Tune to your camera's mount height/angle: this
+                            # should cut off the horizon and anything above
+                            # the track surface (background, plants, walls).
     LF_NUM_BANDS=8,         # horizontal bands the ROI is split into
     LF_MIN_BAND_PIXELS=6,   # a band needs at least this many mask pixels to count
-                            # (sized for 160x120; use ~12+ at 320x240)
-    LF_MIN_BANDS=2,         # need centroids in at least this many bands for a fix
+                            # (sized for 160x120; scale up roughly with pixel
+                            # area for other resolutions, e.g. ~12+ at 320x240)
+    LF_MIN_BANDS=2,         # need centroids in at least this many bands for a fix.
+                            # Raising this trades line-loss sensitivity for
+                            # heading stability: a 2-point line fit is very
+                            # sensitive to single-band noise and can saturate
+                            # heading output on a bad read.
 
     # --- steering control (PD on normalized lateral error) ---
     # error: -1 = line at left edge, 0 = line at target, +1 = line at right edge
@@ -86,6 +111,19 @@ DEFAULTS = dict(
     LF_TARGET_X=None,       # where the line should sit in the frame, in pixels.
                             # None = image center. If your camera is mounted
                             # off-center, set this.
+    LF_STEERING_TRIM=0.0,   # constant added to every steering command, in
+                            # [-1, 1]. Compensates for a chassis/steering
+                            # mechanical bias (e.g. the car visibly pulls
+                            # right at a commanded-straight steering value)
+                            # that isn't fixed by your drivetrain's own
+                            # calibration. Some actuators expose a trim of
+                            # their own (e.g. VESC_STEERING_OFFSET) that
+                            # applies to every drive mode and is the better
+                            # fix when available; this is a fallback for
+                            # setups that don't have one (plain PWM steering
+                            # only calibrates its left/right endpoints, not a
+                            # center) or a residual correction on top. Sign
+                            # matches steering: negative nudges left.
 
     # --- throttle ---
     LF_THROTTLE_MAX=0.30,   # on straights
@@ -108,15 +146,15 @@ def _cfg(cfg, name):
     return getattr(cfg, name, DEFAULTS[name]) if cfg is not None else DEFAULTS[name]
 
 
-class LineFollower:
+class LineFollowerMultiBand:
     """
     DonkeyCar part.
       input:  'cam/image_array'  (RGB numpy array)
       output: 'pilot/steering', 'pilot/throttle', 'cv/image_array'
 
     Signature matches the cv_control template's add_cv_controller(), which
-    constructs the class as LineFollower(pid, cfg). The pid argument is
-    accepted for compatibility but ignored — control is a self-contained PD
+    constructs the class as LineFollowerMultiBand(pid, cfg). The pid argument
+    is accepted for compatibility but ignored — control is a self-contained PD
     loop so this file has no simple_pid dependency.
     """
 
@@ -126,6 +164,7 @@ class LineFollower:
         self.l_min = int(_cfg(cfg, 'LF_LAB_L_MIN'))
         self.hue_min = int(_cfg(cfg, 'LF_HUE_MIN'))
         self.hue_max = int(_cfg(cfg, 'LF_HUE_MAX'))
+        self.sat_min = int(_cfg(cfg, 'LF_HSV_S_MIN'))
 
         self.roi_top = float(_cfg(cfg, 'LF_ROI_TOP'))
         self.num_bands = int(_cfg(cfg, 'LF_NUM_BANDS'))
@@ -136,6 +175,7 @@ class LineFollower:
         self.kd = float(_cfg(cfg, 'LF_STEER_KD'))
         self.kh = float(_cfg(cfg, 'LF_HEADING_GAIN'))
         self.target_x = _cfg(cfg, 'LF_TARGET_X')
+        self.steering_trim = float(_cfg(cfg, 'LF_STEERING_TRIM'))
 
         self.th_max = float(_cfg(cfg, 'LF_THROTTLE_MAX'))
         self.th_min = float(_cfg(cfg, 'LF_THROTTLE_MIN'))
@@ -179,8 +219,13 @@ class LineFollower:
 
         lab = cv2.cvtColor(roi, cv2.COLOR_RGB2LAB)
         L, A, B = cv2.split(lab)
-        hue = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)[:, :, 0]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+        hue, sat = hsv[:, :, 0], hsv[:, :, 1]
+        # sat gate must come before hue is trusted: hue is near-meaningless
+        # for low-saturation (white/gray) pixels, so without it a bright
+        # achromatic surface can pass the hue window on pure noise.
         mask = ((B >= self.b_min) & (A <= self.a_max) & (L >= self.l_min)
+                & (sat >= self.sat_min)
                 & (hue >= self.hue_min) & (hue <= self.hue_max)
                 ).astype(np.uint8) * 255
 
@@ -221,13 +266,25 @@ class LineFollower:
         wgt = ws * (0.5 + cys / roi_h)
         a, bfit = np.polyfit(cys, cxs, 1, w=np.sqrt(wgt))
 
-        # One pass of outlier rejection: vegetation/gravel at the frame edge
-        # can hijack a band's centroid. Drop bands far from the fitted line
-        # and refit with the rest.
-        if len(pts) > self.min_bands:
+        # One pass of outlier rejection: vegetation/gravel/glare at the frame
+        # edge can hijack a band's centroid. Drop bands far from the fitted
+        # line and refit with the rest. Gated on "enough points to fit
+        # meaningfully" (3, since 2 points have zero residual to judge by),
+        # NOT on min_bands -- min_bands is a separate, user-tunable "how many
+        # bands make a valid detection" safety threshold, and coupling the two
+        # meant an outlier landing in an exactly-min_bands detection (a common
+        # case) could never be rejected in the first place.
+        if len(pts) > 2:
             resid = np.abs(cxs - (a * cys + bfit))
             keep = resid < max(0.12 * w, 1.5 * np.median(resid) + 1)
-            if keep.sum() >= self.min_bands and keep.sum() < len(pts):
+            # Floor is 2 (the geometric minimum for a line fit), not
+            # min_bands: the raw detection already cleared min_bands above
+            # (line 255) before we got here, so that safety bar has done its
+            # job. Re-applying it here would mean a detection that's exactly
+            # at min_bands can never have even one point rejected -- which
+            # defeats outlier rejection precisely when it matters most (a
+            # borderline detection is the likeliest to contain a bad point).
+            if keep.sum() >= 2 and keep.sum() < len(pts):
                 cxs, cys, ws, wgt = cxs[keep], cys[keep], ws[keep], wgt[keep]
                 a, bfit = np.polyfit(cys, cxs, 1, w=np.sqrt(wgt))
                 debug['pts'] = [p for p, k in zip(pts, keep) if k]
@@ -273,7 +330,7 @@ class LineFollower:
                 d_err = (error - self.prev_error) / dt
             self.prev_error, self.prev_time = error, now
 
-            steer = self.kp * error + self.kd * d_err + self.kh * heading
+            steer = self.kp * error + self.kd * d_err + self.kh * heading + self.steering_trim
             self.steering = float(np.clip(steer, -1.0, 1.0))
 
             # slow down proportionally to how hard we're steering
@@ -363,7 +420,7 @@ def _test(paths, out_dir="lf_out"):
         else:
             files.append(p)
 
-    lf = LineFollower()
+    lf = LineFollowerMultiBand()
     for f in files:
         if f.lower().endswith(('.mp4', '.avi', '.mov')):
             cap = cv2.VideoCapture(f)
