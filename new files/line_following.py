@@ -51,6 +51,15 @@ stop.
 This runs the exact same pipeline on saved frames and writes overlay images
 showing the mask, detected centroids, fitted line, and steering output.
 (Frames are downscaled to LF_PROC_WIDTH inside run(), exactly as on the car.)
+
+
+--- HOW TO CALIBRATE THE CAMERA OFFSET (LF_TARGET_X) ------------------------
+If the overlay shows the line sitting ON the white target tick but the car
+still drives physically beside the tape, the camera is mounted off-center or
+yawed — image center isn't over the car's centerline. Park the car with its
+centerline EXACTLY over the yellow line, save one camera frame, then:
+  python line_following.py calibrate <frame.jpg>
+It prints the LF_TARGET_X line to paste into myconfig.py.
 -----------------------------------------------------------------------------
 """
 
@@ -237,20 +246,42 @@ DEFAULTS = dict(
    LF_LANE_DIST_MAX_FRAC=0.45,
 
 
-   # --- steering control (PD on normalized lateral error) ---
+   # --- steering control (PID on normalized lateral error) ---
    # error: -1 = line at left edge, 0 = line at target, +1 = line at right edge
    # donkeycar steering: -1 = full left, +1 = full right
    LF_STEER_KP=2.4,        # proportional gain on lateral offset
    LF_STEER_KD=0.35,       # derivative gain (per second)
+   LF_STEER_KI=0.4,        # integral gain (per second). This is what removes
+                           # the constant "tracks the line but rides beside
+                           # it" offset: any persistent bias (servo trim not
+                           # quite centered, drivetrain pull, slight camera
+                           # yaw) leaves a P controller with a steady-state
+                           # error of bias/KP — the car follows the line
+                           # PARALLEL, offset to one side, forever. The
+                           # integral winds up until the residual error is
+                           # zero. Integrates only while status=="tracking";
+                           # held (applied but frozen) during white-guided /
+                           # coasting; reset on a full stop.
+   LF_STEER_I_MAX=0.35,    # cap on the integral term's steering contribution
+                           # (anti-windup: also frozen while output saturated)
    LF_HEADING_GAIN=0.9,    # extra steering from the line's slope (lookahead)
    LF_ERR_DEADBAND=0.0,    # soft deadband on the normalized error: errors
                            # smaller than this are ignored (subtracted, so
                            # response stays continuous). 0 = tightest
                            # centering over the line; raise to ~0.05 only if
                            # the car weaves on straights.
-   LF_TARGET_X=None,       # where the line should sit in the frame, in pixels.
-                           # None = image center. If your camera is mounted
-                           # off-center, set this.
+   LF_TARGET_X=None,       # where the line should sit in the frame, in pixels
+                           # (LF_PROC_WIDTH coords). None = image center. If
+                           # the camera is mounted off-center or yawed, image
+                           # center is NOT over the car's centerline, and the
+                           # car will hold a physical offset from the line
+                           # even with zero control error (the overlay shows
+                           # the line ON the white target tick, yet the car
+                           # sits beside the tape). To calibrate: park the car
+                           # so its centerline is EXACTLY over the yellow
+                           # line, save one camera frame, then run
+                           #   python line_following.py calibrate <frame>
+                           # and paste the printed LF_TARGET_X into myconfig.
 
    # --- lane offset (future: drive IN the left or right lane) ---
    # 0.0 rides directly on top of the yellow line. +1.0 aims the car at the
@@ -259,7 +290,7 @@ DEFAULTS = dict(
    # yellow-to-white distances learned from the white-line detector, so it
    # only engages once those have been observed (falls back to riding the
    # yellow until then).
-   LF_LANE_OFFSET=0.0,
+   LF_LANE_OFFSET= 0.75,  # 0.0 = on yellow, +1.0 = right white, -1.0 = left white
 
 
    # --- throttle ---
@@ -307,7 +338,7 @@ class LineFollower:
 
    Signature matches the cv_control template's add_cv_controller(), which
    constructs the class as LineFollower(pid, cfg). The pid argument is
-   accepted for compatibility but ignored — control is a self-contained PD
+   accepted for compatibility but ignored — control is a self-contained PID
    loop so this file has no simple_pid dependency.
    """
 
@@ -353,6 +384,8 @@ class LineFollower:
 
        self.kp = float(_cfg(cfg, 'LF_STEER_KP'))
        self.kd = float(_cfg(cfg, 'LF_STEER_KD'))
+       self.ki = float(_cfg(cfg, 'LF_STEER_KI'))
+       self.i_max = float(_cfg(cfg, 'LF_STEER_I_MAX'))
        self.kh = float(_cfg(cfg, 'LF_HEADING_GAIN'))
        self.deadband = float(_cfg(cfg, 'LF_ERR_DEADBAND'))
        self.target_x = _cfg(cfg, 'LF_TARGET_X')
@@ -377,6 +410,7 @@ class LineFollower:
        self.frames_since_fix = 10 ** 9
        self.prev_error = None
        self.prev_time = None
+       self.i_term = 0.0        # integral term's steering contribution
        self.lost_frames = 0
        self.lost_since = None
        self.status = "init"
@@ -615,13 +649,21 @@ class LineFollower:
                debug['pts'] = [p for p, k in zip(pts, keep) if k]
 
 
-       # Lateral position comes from the NEAREST detected dashes (bottom-most
-       # centroids), not from extrapolating the fit to the frame bottom —
-       # extrapolation blows up when the line runs nearly horizontal in the
-       # frame (sharp curves).
+       # Lateral position: project the fit to the BOTTOM of the frame —
+       # that's where the car is. The nearest detected dash can sit well up
+       # the ROI (the gap between dashes), so an average of near centroids
+       # reads the x of a point AHEAD of the car; steering then centers
+       # that point, not the car, and on any slanted line (curves, camera
+       # yaw) that is a systematic lateral offset. The centroid average is
+       # kept as a sanity bound: extrapolation blows up when the line runs
+       # nearly horizontal in the frame (sharp curves), so if the projected
+       # x strays too far from the near dashes, trust the dashes instead.
        order = np.argsort(cys)[::-1]          # nearest (largest y) first
        near = order[:3]
        x_near = float(np.average(cxs[near], weights=ws[near]))
+       x_bottom = float(a * roi_h + bfit)
+       if abs(x_bottom - x_near) <= 0.15 * w:
+           x_near = x_bottom
 
        # A real sighting of a DASHED line is multiple separate dashes; see
        # LF_MIN_DASHES. A single blob only counts while already tracking,
@@ -756,15 +798,22 @@ class LineFollower:
            debug['target'] = target
 
 
-           # PD + heading feed-forward
+           # PID + heading feed-forward
            d_err = 0.0
            if self.prev_error is not None and self.prev_time is not None:
                dt = max(now - self.prev_time, 1e-3)
                d_err = (error - self.prev_error) / dt
+               # Integrate only while tracking, with dt clamped so a frame
+               # hiccup can't spike the sum, and frozen while the output is
+               # already saturated toward the error (classic anti-windup).
+               if abs(self.steering) < 1.0 or np.sign(self.steering) != np.sign(error):
+                   self.i_term = float(np.clip(
+                       self.i_term + self.ki * error * min(dt, 0.2),
+                       -self.i_max, self.i_max))
            self.prev_error, self.prev_time = error, now
 
 
-           steer = self.kp * error + self.kd * d_err + self.kh * heading
+           steer = self.kp * error + self.kd * d_err + self.i_term + self.kh * heading
            self.steering = float(np.clip(steer, -1.0, 1.0))
 
 
@@ -794,7 +843,9 @@ class LineFollower:
                debug['target'] = target
                debug['x_est'] = x_est
                self.prev_error = None
-               steer = self.kp * error
+               # keep applying the learned trim (i_term) but don't update it
+               # from white-line estimates — the error source changed
+               steer = self.kp * error + self.i_term
                self.steering = float(np.clip(steer, -1.0, 1.0))
                self.throttle = self.th_min
                self.status = "white-guided"
@@ -807,6 +858,7 @@ class LineFollower:
                if now - self.lost_since > self.lost_stop_sec:
                    # lost for too long — stop rather than wander off the track
                    self.steering, self.throttle = 0.0, 0.0
+                   self.i_term = 0.0   # relearn trim on the next acquisition
                    self.status = "stopped (line lost)"
                else:
                    # dropout (dash gap or momentary occlusion): hold the last
@@ -876,7 +928,7 @@ class LineFollower:
            dr = f"{self.dist_right:.0f}" if self.dist_right is not None else "?"
            lane = f" lane:{dl}/{dr}"
        for i, s in enumerate([
-           f"st:{self.steering:+.2f} th:{self.throttle:.2f}",
+           f"st:{self.steering:+.2f} th:{self.throttle:.2f} i:{self.i_term:+.2f}",
            f"hdg:{heading:+.2f}{lane}",
            self.status,
        ]):
@@ -936,9 +988,40 @@ def _test(paths, out_dir="lf_out"):
 
 
 
+def _calibrate(path):
+   """
+   Measure LF_TARGET_X from a frame taken with the car parked so its
+   centerline sits EXACTLY over the yellow line. Whatever x the line reads
+   in that frame is, by construction, where the line should sit whenever
+   the car is centered on it — regardless of how the camera is mounted.
+   """
+   bgr = cv2.imread(path)
+   if bgr is None:
+       print(f"unreadable: {path}")
+       return
+   lf = LineFollower()
+   lf.min_dashes = 1   # a parked close-up may show only one dash; that's fine
+                       # here — the operator is looking at the frame anyway
+   lf.run(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+   if lf.last_x is None:
+       print("no yellow line detected in this frame — repark so at least one "
+             "dash is clearly visible in the bottom part of the frame, or "
+             "check the frame isn't over/under-exposed")
+       return
+   w = int(lf.proc_width) if lf.proc_width else bgr.shape[1]
+   off = lf.last_x - w / 2.0
+   print(f"line at x={lf.last_x:.1f}, image center {w / 2.0:.1f} "
+         f"(camera offset {off:+.1f}px in {w}-wide coords)")
+   print(f"add to myconfig.py:  LF_TARGET_X = {lf.last_x:.0f}")
+
+
+
+
 if __name__ == '__main__':
    import sys
-   if len(sys.argv) >= 3 and sys.argv[1] == 'test':
+   if len(sys.argv) >= 3 and sys.argv[1] == 'calibrate':
+       _calibrate(sys.argv[2])
+   elif len(sys.argv) >= 3 and sys.argv[1] == 'test':
        args = sys.argv[2:]
        out = "lf_out"
        if "--out" in args:
