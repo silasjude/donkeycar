@@ -14,6 +14,7 @@ Options:
                             [default: myconfig.py]
 """
 import logging
+import os
 
 from docopt import docopt
 from simple_pid import PID
@@ -21,7 +22,6 @@ from simple_pid import PID
 import donkeycar as dk
 from donkeycar.parts.tub_v2 import TubWriter
 from donkeycar.parts.datastore import TubHandler
-from donkeycar.parts.line_follower import LineFollower
 from donkeycar.templates.complete import add_odometry, add_camera, \
     add_user_controller, add_drivetrain, add_simulator, add_imu, DriveMode, \
     UserPilotCondition, ToggleRecording
@@ -44,6 +44,12 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     Parts may have named outputs and inputs. The framework handles passing named outputs
     to parts requesting the same named input.
     '''
+
+    # Use a separate data folder from manage.py's tub -- this script records
+    # a different set of inputs (steering/throttle vs. user/angle/user/throttle/
+    # user/mode), and reusing the same folder trips the tub schema-mismatch
+    # assertion in datastore_v2.py.
+    cfg.DATA_PATH = os.path.join(cfg.CAR_PATH, 'data_line')
 
     #Initialize car
     V = dk.vehicle.Vehicle()

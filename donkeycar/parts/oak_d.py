@@ -139,7 +139,7 @@ class OakD(object):
 
         cam_rgb.setResolution(res)
         # Set preview size to match model input
-        cam_rgb.setPreviewSize(self.image_w, self.image_h)
+        cam_rgb.setPreviewSize(width, height)
         cam_rgb.setInterleaved(False)
 
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
@@ -189,25 +189,24 @@ class OakD(object):
         #
         # convert camera frames to images
         #
-        if self.enable_rgb or self.enable_depth:
-
+        if self.enable_depth:
             self.depth_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 name="depth", maxSize=1, blocking=False
             )
+            self.depth_image = self.get_frame(self.depth_queue)
+
+        if self.enable_rgb:
             self.rgb_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 "rgb", maxSize=1, blocking=False
             )
-
-            depth_frame = self.get_frame(self.depth_queue)
-            rgb_frame = self.get_frame(self.rgb_queue)
-
-            self.depth_image = depth_frame
-            self.color_image = rgb_frame
+            # depthai returns frames in BGR (OpenCV's native order); donkeycar
+            # expects RGB throughout (tub recording, training, display).
+            self.color_image = cv2.cvtColor(
+                self.get_frame(self.rgb_queue), cv2.COLOR_BGR2RGB
+            )
 
         if self.resize:
             if self.width != WIDTH or self.height != HEIGHT:
-                import cv2
-
                 self.color_image = (
                     cv2.resize(
                         self.color_image, (self.width, self.height), cv2.INTER_NEAREST
