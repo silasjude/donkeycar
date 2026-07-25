@@ -53,19 +53,23 @@ showing the mask, detected centroids, fitted line, and steering output.
 (Frames are downscaled to LF_PROC_WIDTH inside run(), exactly as on the car.)
 
 
---- HOW TO CALIBRATE THE CAMERA OFFSET (LF_TARGET_X) ------------------------
+--- HOW TO CALIBRATE THE CAMERA (LF_TARGET_X, LF_HEADING_BIAS) --------------
 If the overlay shows the line sitting ON the white target tick but the car
 still drives physically beside the tape, the camera is mounted off-center or
 yawed — image center isn't over the car's centerline. Park the car with its
-centerline EXACTLY over the yellow line, save one camera frame, then:
+centerline EXACTLY over the yellow line, pointing STRAIGHT along it, save
+one camera frame, then:
   python line_following.py calibrate <frame.jpg>
-It prints the LF_TARGET_X line to paste into myconfig.py.
+It prints the LF_TARGET_X and LF_HEADING_BIAS lines to paste into
+myconfig.py (the second cancels the camera-yaw slope the fit reads even
+when the car is perfectly aligned).
 -----------------------------------------------------------------------------
 """
 
 
 import logging
 import time
+from collections import deque
 
 
 import cv2
@@ -233,25 +237,99 @@ DEFAULTS = dict(
    # (largest bbox side, as a fraction of ROI height) to count.
    LF_WHITE_MIN_AREA_FRAC=0.001,
    LF_WHITE_MIN_EXTENT=0.2,
-   # White guidance only bridges GAPS in the yellow (dash gaps, a worn or
-   # deeply shadowed stretch): it engages for at most this many seconds
-   # after the last confirmed yellow fix, then the normal coast/stop logic
-   # takes over. Unbounded, a picked-up car staring at any bright edge
-   # would keep "driving" forever.
-   LF_WHITE_GUIDE_SEC=3.0,
-   # Learned yellow-to-white distances are only trusted inside this range
-   # (fraction of image width); outside it the sample is a misclassified
-   # speck or a line from a neighboring track.
+   # White guidance bridges stretches without yellow: dash gaps, worn or
+   # deeply shadowed paint — and, in lane-offset driving, whole TURNS
+   # (riding -0.75, the yellow regularly exits the frame for the entire
+   # arc of a bend while the near white boundary stays in view; session
+   # 35/36 footage). It engages for at most this many seconds after the
+   # last confirmed yellow fix, then the normal coast/stop logic takes
+   # over. Unbounded, a picked-up car staring at any bright edge would
+   # keep "driving" forever; 6s covers the longest bend at cornering
+   # speed while still going passive within a couple of car lengths if
+   # the scene is genuinely gone.
+   LF_WHITE_GUIDE_SEC=6.0,
+   # Gates on the yellow-to-white geometry, all fractions of image width.
+   # MIN/MAX bound which white CLUSTERS can be the lane boundary at all
+   # (mixed-row offsets); BOT_MIN..MAX bound the LEARNED samples, which
+   # are bottom-projected and therefore larger — the true bottom-row lane
+   # widths measure ~106px left / ~128px right (0.28/0.33) on this track.
+   # The junk these exclude: white glare within a few px of the yellow,
+   # the second parallel line on the right (~150-170px mixed-row, farther
+   # still at the bottom), and neighboring-track paint. Cluster selection
+   # (nearest valid line wins) is the main defense; these are backstops.
    LF_LANE_DIST_MIN_FRAC=0.08,
    LF_LANE_DIST_MAX_FRAC=0.45,
+   LF_LANE_DIST_BOT_MIN_FRAC=0.15,
+   # Lane widths are only LEARNED while driving straight-ish (|corrected
+   # heading| below this): mid-turn the bottom projections are chord-vs-arc
+   # distorted (measured 177/102px vs 106/128 straight) and those samples
+   # dragged the target sideways exactly in corners — the car crossed the
+   # center line into the wrong lane on turns because of it. Frozen-in-turn
+   # estimates stay at their straight-section values instead.
+   LF_LANE_LEARN_MAX_HEADING=0.20,
+   # ...and only from white clusters whose lowest sighting reaches this
+   # fraction of the ROI height: clusters seen solely near the ROI top
+   # anchor their bottom projection on extrapolation through clutter.
+   LF_LANE_LEARN_NEAR_FRAC=0.3,
+   # The lane width in bottom-row pixels, if you know it. The width is a
+   # TRACK CONSTANT, and the live estimate of it is the weakest link in
+   # lane driving: white-cluster bottom projections scatter 85-170px
+   # frame to frame (sparse centroids, extrapolation), so the learned
+   # median lands ±20px differently per run — visible as a different ride
+   # position each session, and it starves entirely when the car STARTS
+   # inside a lane (the near boundary exits the frame bottom before it's
+   # ever seen). Set this to pin the offset geometry; measured ~140px on
+   # this track (sessions 12-15, several gate configurations agree).
+   # None = fall back to live learning (dist_left/dist_right).
+   LF_LANE_WIDTH_PX=None,
+   # Same-side white detections are clustered by their offset from the
+   # yellow fit; x-gaps larger than this (fraction of image width) split
+   # clusters, and only the cluster NEAREST the yellow is used. Averaging
+   # everything on a side (the old behavior) blended the true boundary
+   # with the second parallel line into a distance matching neither.
+   LF_WHITE_CLUSTER_FRAC=0.06,
 
 
    # --- steering control (PID on normalized lateral error) ---
    # error: -1 = line at left edge, 0 = line at target, +1 = line at right edge
    # donkeycar steering: -1 = full left, +1 = full right
-   LF_STEER_KP=2.4,        # proportional gain on lateral offset
-   LF_STEER_KD=0.35,       # derivative gain (per second)
-   LF_STEER_KI=0.4,        # integral gain (per second). This is what removes
+   #
+   # Retuned 2026-07-23 against the afternoon tub sessions: the car held the
+   # line but SWERVED constantly on straights. Replaying those sessions
+   # showed why: the detector's lateral reading jumps ~20px frame to frame
+   # (the dashes marching through the bands wiggle the fit, and projecting
+   # to the frame bottom scales slope jitter by the ROI height), and the
+   # old controller passed that noise straight to the servo — the raw
+   # one-frame D term alone contributed more steering than every real
+   # signal combined (std 0.66 vs P's 0.44), and the heading term regularly
+   # saturated its whole +/-0.9 range. So the measurements are now low-pass
+   # filtered before the PID sees them (LF_X_FILTER_TC,
+   # LF_HEADING_FILTER_TC), the derivative gets its own filter
+   # (LF_D_FILTER_TC), and the command is slew-limited (LF_STEER_SLEW).
+   # Closed-loop sim (bicycle model, 100-150ms latency, measured noise):
+   # steering std on straights 0.64 -> 0.17 at equal-or-better lateral
+   # tracking, stable across latency/servo-lag/gain perturbations —
+   # whereas heavier filtering (x TC 0.15s+) with a tight slew limit went
+   # UNSTABLE: the heading term and D are the loop's phase lead, they must
+   # stay fast. Don't raise the TCs to chase more calm.
+   LF_STEER_KP=1.2,        # proportional gain on lateral offset. Lowered
+                           # 1.6 -> 1.2 on 2026-07-24: the image-x the P
+                           # term chases mixes true lateral offset (233px/m)
+                           # with instantaneous camera yaw (279px/rad), and
+                           # with the measured ~230ms loop delay the yaw
+                           # share turns surplus P gain into the ~1Hz jerk.
+   LF_STEER_KD=0.30,       # derivative gain (per second), computed on the
+                           # filtered error and then low-passed again
+   LF_X_FILTER_TC=0.12,    # seconds; EMA time constant on the lateral
+                           # measurement (~2.4 frames at 20 Hz)
+   LF_D_FILTER_TC=0.08,    # seconds; EMA on the derivative term
+   LF_HEADING_FILTER_TC=0.06,  # seconds; EMA on the heading measurement.
+                           # Deliberately light — see the retune note above.
+   LF_STEER_SLEW=6.0,      # max steering change per second (full lock to
+                           # full lock in ~1/3 s). Protects the servo and
+                           # kills single-frame spikes; sim shows anything
+                           # much tighter induces a limit cycle.
+   LF_STEER_KI=0.2,        # integral gain (per second). This is what removes
                            # the constant "tracks the line but rides beside
                            # it" offset: any persistent bias (servo trim not
                            # quite centered, drivetrain pull, slight camera
@@ -259,12 +337,70 @@ DEFAULTS = dict(
                            # error of bias/KP — the car follows the line
                            # PARALLEL, offset to one side, forever. The
                            # integral winds up until the residual error is
-                           # zero. Integrates only while status=="tracking";
-                           # held (applied but frozen) during white-guided /
-                           # coasting; reset on a full stop.
-   LF_STEER_I_MAX=0.35,    # cap on the integral term's steering contribution
-                           # (anti-windup: also frozen while output saturated)
-   LF_HEADING_GAIN=0.9,    # extra steering from the line's slope (lookahead)
+                           # zero. It is a TRIM estimator, nothing more:
+                           # since 2026-07-24 it only integrates while
+                           # tracking NEAR-STRAIGHT with a SMALL error (see
+                           # LF_STEER_I_H_GATE / LF_STEER_I_ERR_GATE). The
+                           # old always-on ki=0.4 wound to its cap inside
+                           # every curve (a curve needs sustained steering
+                           # the heading term didn't fully supply) and then
+                           # unwound over seconds on the exit, dragging the
+                           # car across the line — replays of sessions 17-18
+                           # show i railed at ±0.35 for whole curve+exit
+                           # stretches, and the closed-loop sim reproduces
+                           # the resulting S-swerve on every straight that
+                           # follows a bend. Held (applied but frozen)
+                           # during white-guided / coasting; reset on stop.
+   LF_STEER_I_MAX=0.20,    # cap on the integral term's steering contribution
+                           # (anti-windup: also frozen while output saturated).
+                           # 0.20 covers realistic servo/drivetrain trim; the
+                           # old 0.35 was a third of full lock — as a stale
+                           # post-curve residue it alone steered the car
+                           # across the yellow.
+   LF_STEER_I_H_GATE=0.25, # |corrected heading| must be below this for the
+                           # integrator to update (trim is only observable
+                           # while driving straight; in curves the sustained
+                           # error is curvature, not trim)
+   LF_STEER_I_ERR_GATE=0.25,  # ...and |error| below this (a big error means
+                           # we're actively converging on the line/lane —
+                           # integrating the transient just adds overshoot)
+   LF_HEADING_GAIN=0.4,    # extra steering from the line's slope. NOTE
+                           # (2026-07-24, identified from footage): this is
+                           # NOT a damping term. A small camera yaw
+                           # translates the line in the image without
+                           # changing its slope (first-order), so the
+                           # measured heading carries almost no yaw signal
+                           # — regression against the true yaw (phase-
+                           # correlated far-field strip) gives h_f ≈
+                           # 0.35*err + 0.10*yaw: it is mostly REDUNDANT
+                           # POSITION feedback plus, in bends, the genuine
+                           # curvature lean (the useful part: curve feed-
+                           # forward). So this gain buys turn-in and pays
+                           # for it with extra position-loop gain, which
+                           # the ~230ms loop delay punishes. 0.4 is the
+                           # identified-plant optimum; 1.6 (tried earlier
+                           # on the wrong belief it damps) made the weave
+                           # worse. Real damping comes from LF_GYRO_GAIN.
+   LF_HEADING_CLIP=0.7,    # cap on |heading| before the gain. The raw
+                           # heading hit +/-1.0 routinely; beyond ~0.7 it's
+                           # a fit artifact (near-horizontal line), not a
+                           # steer-harder signal.
+   LF_HEADING_BIAS=0.0,    # subtracted from the measured heading: residual
+                           # camera yaw AFTER the vanishing-point
+                           # convergence correction (see detect()). The
+                           # clean straight-frame residual on this camera
+                           # measures +0.06; before the correction existed
+                           # this read +0.12 because riding position leaked
+                           # into it. Measure it:
+                           #   python line_following.py calibrate <frame>
+                           # (same parked-on-the-line frame as LF_TARGET_X)
+   LF_VP_Y_FRAC=0.6,      # vanishing-point row as a fraction of image
+                           # height, for the convergence correction: ground
+                           # lines parallel to the car converge here, so a
+                           # line's expected image slope grows with its
+                           # lateral offset by 1/(h*(1-this)) per px. The
+                           # horizon sits ~55% down this camera's frame
+                           # (session fit implied 59%).
    LF_ERR_DEADBAND=0.0,    # soft deadband on the normalized error: errors
                            # smaller than this are ignored (subtracted, so
                            # response stays continuous). 0 = tightest
@@ -283,6 +419,102 @@ DEFAULTS = dict(
                            #   python line_following.py calibrate <frame>
                            # and paste the printed LF_TARGET_X into myconfig.
 
+   # --- vision gyro (yaw-rate damping) ---
+   # Identified from session-21 footage (2026-07-24): the loop's real
+   # problem is that NOTHING in the frame measures the car's yaw. A small
+   # camera yaw just TRANSLATES the line in the image (first-order, the
+   # slope doesn't change), so the "lateral error" the PID chases is
+   # mostly instantaneous yaw (279px per rad vs 233px per meter of true
+   # offset — in a weave the yaw part dominates), and the heading term is
+   # ~0.35*err redundant position feedback, NOT damping (regression of
+   # h_f against the true yaw extracted from the footage: yaw coefficient
+   # +0.10, i.e. nil). With the measured 200-250ms loop delay (steering ->
+   # visible yaw-rate cross-correlation peaks at 4-5 frames) the loop is
+   # a stiff spring with no damper: it limit-cycles at ~0.9Hz — the
+   # "jerky swerve about once a second".
+   #
+   # The fix measures yaw rate directly: phase-correlate a strip of the
+   # FAR BACKGROUND (above the horizon, rows 0.35-0.50 of the frame)
+   # between consecutive frames. Distant scenery has no parallax, so its
+   # horizontal shift is pure camera yaw — a vision gyro (~1ms/frame at
+   # 384px). Steering gets -LF_GYRO_GAIN * yaw_rate: true rate damping,
+   # which is exactly what a delayed position loop needs. Set gain 0 to
+   # disable (e.g. if the horizon strip is full of moving people).
+   # --- slow curve feed-forward ---
+   # Measured on the 2026-07-24 15:50 lap sessions (bottom-row dash pixels,
+   # which the controller cannot fake): on straights the car sits dead on
+   # the line (dash at x=188-193 of 192), but in every bend it runs
+   # 40-50px (~0.2m) toward the OUTSIDE — right of the line in left turns,
+   # left in right turns. That's textbook steady-state error: holding a
+   # bend needs ~1.65*kappa of steering, the heading term at kh=0.4
+   # supplies ~0.5*kappa, the trim integrator is deliberately frozen in
+   # curves, so P must carry the rest — and P only pushes when there IS an
+   # error. This term supplies the missing steady steering: the SLOW
+   # component of the heading lean (EMA over LF_CURVE_TC) is the sustained
+   # curve signature — boosting it acts like an in-curve integrator that
+   # is bounded (proportional to the measured lean) and decays with the
+   # lean itself on exit, so it cannot reproduce the old ki windup-unwind
+   # S-swerve. The fast component (turn-in, noise) stays at kh.
+   # FIELD-TUNED VALUES (2026-07-24 evening, confirmed working on track —
+   # note the sign is NEGATIVE, opposite what the sim predicted; on the
+   # real car the un-countered slow lean was cutting the car INTO the
+   # curve/to the right, so the working gain opposes the lean):
+   #   LF_LANE_OFFSET  0.0 (center line)  -> LF_CURVE_GAIN = -0.8
+   #   LF_LANE_OFFSET -0.75 (left lane)   -> LF_CURVE_GAIN = -0.8
+   #   LF_LANE_OFFSET +0.5 (right lane)   -> LF_CURVE_GAIN = -0.2
+   # Change this value together with the offset. Applies only while
+   # TRACKING; blind (white-guided) turns exclude this term on purpose —
+   # a negative gain fed the frozen mid-turn lean would steer against
+   # completing the turn.
+   LF_CURVE_GAIN=-0.8,     # steering per unit of slow heading lean
+   LF_CURVE_TC=0.7,        # seconds; EMA defining "sustained". Shorter =
+                           # quicker to full curve hold but more of the
+                           # heading noise leaks into this high-gain path.
+
+   LF_GYRO_GAIN=0.3,       # steering per rad/s of yaw (sim-tuned on the
+                           # identified plant; the win is biggest exactly
+                           # where the car was worst: at speed and at high
+                           # latency, straight-line weave rms 10 -> 4cm)
+   LF_GYRO_FILTER_TC=0.05, # seconds; light EMA on the measured yaw rate
+   LF_GYRO_WASHOUT_TC=1.0, # seconds; the damper acts on yaw rate MINUS its
+                           # own slow average (a washout, as in aircraft yaw
+                           # dampers). A steady curve is a constant yaw rate
+                           # — un-washed, the damper steers against the turn
+                           # for its whole duration; washed out, it only
+                           # resists CHANGES in yaw rate (the 0.9Hz weave)
+                           # and lets a held arc pass. 0 disables washout.
+   LF_GYRO_STRIP=(0.35, 0.50),  # frame-height fractions of the strip; keep
+                           # it ABOVE the horizon (~0.55 on this camera) so
+                           # only zero-parallax background is in it
+   LF_CAM_HFOV_DEG=69.0,   # camera horizontal field of view, for the
+                           # px-shift -> yaw-angle conversion (OAK-D RGB)
+
+   # --- temporal consistency gate on the yellow fix ---
+   # Observed on the 2026-07-24 lap sessions (34 events in 3 laps): for one
+   # or two frames the fit latches onto color-alike clutter (dead leaves,
+   # pavement patches, shoes) mixed in with sparse real dashes — the fitted
+   # line swings diagonal (heading pegs at +/-1) and the bottom projection
+   # jumps 50-140px, and the car twitches toward the phantom before the
+   # next clean frame corrects it. The line cannot physically do that
+   # between frames at 20Hz: the car's own yaw moves it at most
+   # f*yaw_rate*dt (~15px/frame per rad/s, and we MEASURE yaw rate with
+   # the vision gyro) and lateral motion adds a few px more. So a new fix
+   # is only accepted if it lands near where the last accepted fix
+   # predicts; otherwise the frame is treated as a dropout (the existing
+   # coast/white-guided logic rides through it, holding steering). To
+   # avoid locking out a genuinely new position forever (e.g. the gate
+   # engaged on a phantom), the allowance grows with each consecutive
+   # rejection and after LF_TEMPORAL_MAX_REJECT rejections the fix is
+   # accepted unconditionally (filters reseed).
+   LF_TEMPORAL_JUMP=0.09,     # base allowed |x jump| per frame, fraction of
+                              # image width (~35px; measured noise is ~10px,
+                              # real yaw shift is compensated separately)
+   LF_TEMPORAL_H_JUMP=0.45,   # allowed heading change per frame; real yaw
+                              # changes heading < ~0.2/frame even at full
+                              # lock, phantom fits swing 0.5-2.0
+   LF_TEMPORAL_MAX_REJECT=6,  # accept unconditionally after this many
+                              # consecutive rejections (0.3s at 20Hz)
+
    # --- lane offset (future: drive IN the left or right lane) ---
    # 0.0 rides directly on top of the yellow line. +1.0 aims the car at the
    # nearest white line to the RIGHT of the yellow, -1.0 at the white line
@@ -290,7 +522,16 @@ DEFAULTS = dict(
    # yellow-to-white distances learned from the white-line detector, so it
    # only engages once those have been observed (falls back to riding the
    # yellow until then).
-   LF_LANE_OFFSET= 0.75,  # 0.0 = on yellow, +1.0 = right white, -1.0 = left white
+   # NOTE: set this in myconfig.py, not here — myconfig.py overrides this
+   # file, so editing the default does nothing once myconfig defines it
+   # (that is exactly what happened on 2026-07-23: DEFAULTS said 0.75 while
+   # myconfig said 0.0, and every "different offset" run actually drove 0.0).
+   # The effective value is logged at startup; check it there.
+   LF_LANE_OFFSET=0.0,     # 0.0 = on yellow, +1.0 = right white, -1.0 = left white
+   LF_LANE_RAMP_SEC=1.5,   # seconds to ramp the offset in/out once the
+                           # needed lane distance is known — stepping the
+                           # target sideways by ~80px in one frame would
+                           # command a swerve.
 
 
    # --- throttle ---
@@ -380,16 +621,53 @@ class LineFollower:
        self.white_guide_sec = float(_cfg(cfg, 'LF_WHITE_GUIDE_SEC'))
        self.lane_dist_min_frac = float(_cfg(cfg, 'LF_LANE_DIST_MIN_FRAC'))
        self.lane_dist_max_frac = float(_cfg(cfg, 'LF_LANE_DIST_MAX_FRAC'))
+       self.lane_dist_bot_min_frac = float(_cfg(cfg, 'LF_LANE_DIST_BOT_MIN_FRAC'))
+       self.learn_max_heading = float(_cfg(cfg, 'LF_LANE_LEARN_MAX_HEADING'))
+       self.learn_near_frac = float(_cfg(cfg, 'LF_LANE_LEARN_NEAR_FRAC'))
+       # LF_LANE_WIDTH_PX: None, a single number, or a (left, right) pair.
+       # The px-per-meter mapping is NOT symmetric on this camera (measured
+       # 2026-07-24: the left lane spans ~170px at the bottom row from the
+       # left-lane vantage, the right ~140) — one shared constant made
+       # -0.5 hug the yellow while +0.5 sat correctly.
+       lw = _cfg(cfg, 'LF_LANE_WIDTH_PX')
+       if lw is None:
+           self.lane_width_l = self.lane_width_r = None
+       elif np.isscalar(lw):
+           self.lane_width_l = self.lane_width_r = float(lw)
+       else:
+           self.lane_width_l, self.lane_width_r = float(lw[0]), float(lw[1])
+       self.lane_width_px = lw   # kept for the startup log
+       self.vp_y_frac = float(_cfg(cfg, 'LF_VP_Y_FRAC'))
 
 
        self.kp = float(_cfg(cfg, 'LF_STEER_KP'))
        self.kd = float(_cfg(cfg, 'LF_STEER_KD'))
        self.ki = float(_cfg(cfg, 'LF_STEER_KI'))
        self.i_max = float(_cfg(cfg, 'LF_STEER_I_MAX'))
+       self.i_h_gate = float(_cfg(cfg, 'LF_STEER_I_H_GATE'))
+       self.i_err_gate = float(_cfg(cfg, 'LF_STEER_I_ERR_GATE'))
+       self.curve_gain = float(_cfg(cfg, 'LF_CURVE_GAIN'))
+       self.curve_tc = float(_cfg(cfg, 'LF_CURVE_TC'))
+       self.gyro_gain = float(_cfg(cfg, 'LF_GYRO_GAIN'))
+       self.gyro_tc = float(_cfg(cfg, 'LF_GYRO_FILTER_TC'))
+       self.gyro_washout_tc = float(_cfg(cfg, 'LF_GYRO_WASHOUT_TC'))
+       self.gyro_strip = tuple(_cfg(cfg, 'LF_GYRO_STRIP'))
+       self.cam_hfov = float(_cfg(cfg, 'LF_CAM_HFOV_DEG'))
+       self.temporal_jump = float(_cfg(cfg, 'LF_TEMPORAL_JUMP'))
+       self.temporal_h_jump = float(_cfg(cfg, 'LF_TEMPORAL_H_JUMP'))
+       self.temporal_max_reject = int(_cfg(cfg, 'LF_TEMPORAL_MAX_REJECT'))
        self.kh = float(_cfg(cfg, 'LF_HEADING_GAIN'))
+       self.h_clip = float(_cfg(cfg, 'LF_HEADING_CLIP'))
+       self.h_bias = float(_cfg(cfg, 'LF_HEADING_BIAS'))
+       self.x_tc = float(_cfg(cfg, 'LF_X_FILTER_TC'))
+       self.d_tc = float(_cfg(cfg, 'LF_D_FILTER_TC'))
+       self.h_tc = float(_cfg(cfg, 'LF_HEADING_FILTER_TC'))
+       self.steer_slew = float(_cfg(cfg, 'LF_STEER_SLEW'))
        self.deadband = float(_cfg(cfg, 'LF_ERR_DEADBAND'))
        self.target_x = _cfg(cfg, 'LF_TARGET_X')
        self.lane_offset = float(_cfg(cfg, 'LF_LANE_OFFSET'))
+       self.lane_ramp_sec = float(_cfg(cfg, 'LF_LANE_RAMP_SEC'))
+       self.white_cluster_frac = float(_cfg(cfg, 'LF_WHITE_CLUSTER_FRAC'))
 
 
        self.th_max = float(_cfg(cfg, 'LF_THROTTLE_MAX'))
@@ -409,14 +687,38 @@ class LineFollower:
        self.throttle = 0.0
        self.frames_since_fix = 10 ** 9
        self.prev_error = None
-       self.prev_time = None
        self.i_term = 0.0        # integral term's steering contribution
        self.lost_frames = 0
        self.lost_since = None
        self.status = "init"
        self.last_x = None       # last known yellow-line x (px, full-frame)
-       self.dist_left = None    # learned yellow -> nearest-left-white distance (px, EMA)
-       self.dist_right = None   # learned yellow -> nearest-right-white distance (px, EMA)
+       self.dist_left = None    # learned yellow -> nearest-left-white distance (px)
+       self.dist_right = None   # learned yellow -> nearest-right-white distance (px)
+       self._dl_buf = deque(maxlen=40)   # recent accepted distance samples;
+       self._dr_buf = deque(maxlen=40)   # dist_* = median (robust to junk)
+       self.x_f = None          # filtered lateral measurement (px)
+       self.h_f = None          # filtered heading measurement
+       self.d_f = 0.0           # filtered derivative term (steering units)
+       self.last_err = 0.0      # last normalized error (HUD)
+       self.last_heading = None # last raw heading (calibrate + HUD)
+       self._t_prev = None      # last run() wall time, for loop dt
+       self._filt_time = None   # last time the x/heading filters updated
+       self._lane_applied = 0.0 # lane offset actually in force (ramped)
+       self.yaw_rate_f = 0.0    # filtered vision-gyro yaw rate, rad/s (+ = right)
+       self._gyro_slow = 0.0    # washout state: slow average of yaw_rate_f
+       self._suspect_streak = 0 # consecutive fixes rejected by the temporal gate
+       self.h_slow = 0.0        # sustained heading lean (curve feed-forward)
+       self._last_guided = 0.0  # wall time of the last white-guided steer
+       self._gyro_prev = None   # previous far-field strip (float32 gray)
+       self._gyro_win = None    # Hanning window for phaseCorrelate
+
+       logger.info(
+           "LineFollower up: kp=%.2f kd=%.2f ki=%.2f kh=%.2f "
+           "lane_offset=%+.2f lane_width=%s target_x=%s roi_top=%.2f "
+           "proc_width=%s (values come from myconfig.py when set there — "
+           "DEFAULTS edits do not apply if myconfig defines the key)",
+           self.kp, self.kd, self.ki, self.kh, self.lane_offset,
+           self.lane_width_px, self.target_x, self.roi_top, self.proc_width)
 
 
        # morphology kernel, sized on first frame (cleans mask speckle).
@@ -554,8 +856,14 @@ class LineFollower:
        min_ext = self.white_min_extent * rh
        n, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
        for i in range(1, n):
-           ext = max(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
-           if stats[i, cv2.CC_STAT_AREA] < min_area or ext < min_ext:
+           bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+           ext = max(bw, bh)
+           # wide-and-flat blobs are pavement seams / crosswalk bands /
+           # sun-shadow boundaries lying ACROSS the track (session 13
+           # showed one spanning the whole ROI top) — a lane boundary
+           # never presents as a near-horizontal full-width stripe
+           seam = bw >= 0.5 * rw and bh <= 0.15 * rh
+           if stats[i, cv2.CC_STAT_AREA] < min_area or ext < min_ext or seam:
                white[labels == i] = 0
        return white, self._band_centroids(white, split=True)
 
@@ -654,25 +962,33 @@ class LineFollower:
        # the ROI (the gap between dashes), so an average of near centroids
        # reads the x of a point AHEAD of the car; steering then centers
        # that point, not the car, and on any slanted line (curves, camera
-       # yaw) that is a systematic lateral offset. The centroid average is
-       # kept as a sanity bound: extrapolation blows up when the line runs
-       # nearly horizontal in the frame (sharp curves), so if the projected
-       # x strays too far from the near dashes, trust the dashes instead.
+       # yaw) that is a systematic lateral offset. The centroid average
+       # bounds the extrapolation, which blows up when the line runs
+       # nearly horizontal in the frame (sharp curves). The bound is a
+       # CLAMP, not a switch: the old either/or between two estimators up
+       # to 57px apart toggled frame to frame (69%/31% in the afternoon
+       # sessions) and was itself a large noise source.
        order = np.argsort(cys)[::-1]          # nearest (largest y) first
        near = order[:3]
        x_near = float(np.average(cxs[near], weights=ws[near]))
        x_bottom = float(a * roi_h + bfit)
-       if abs(x_bottom - x_near) <= 0.15 * w:
-           x_near = x_bottom
+       x_near += float(np.clip(x_bottom - x_near, -0.15 * w, 0.15 * w))
 
        # A real sighting of a DASHED line is multiple separate dashes; see
        # LF_MIN_DASHES. A single blob only counts while already tracking,
-       # and only near where the line was last seen.
+       # and only near where the line was last seen. In a turn the line
+       # sweeps laterally fast and dashes leave the frame edge (61% of
+       # loss episodes happened at |heading|>0.3), so the allowed jump
+       # widens with the current heading — a lone dash at the frame edge
+       # keeps the fix alive through the corner.
        n_blobs = cv2.connectedComponents(mask, connectivity=8)[0] - 1
        if n_blobs < self.min_dashes:
            recent = self.frames_since_fix <= self.single_dash_grace
+           allow = self.single_dash_max_jump * w
+           if self.h_f is not None:
+               allow *= 1.0 + min(abs(self.h_f - self.h_bias), 1.0)
            near_last = (self.last_x is not None
-                        and abs(x_near - self.last_x) <= self.single_dash_max_jump * w)
+                        and abs(x_near - self.last_x) <= allow)
            if not (recent and near_last):
                return False, None, 0.0, debug
 
@@ -680,7 +996,22 @@ class LineFollower:
        # heading: slope, normalized. a is px-x per px-y; y grows downward, so
        # a > 0 means the line moves right toward the car => it leans LEFT
        # ahead of the car => steer left. Negate to get "lean of the road ahead".
-       heading = float(np.clip(-a * roi_h / (w / 2.0), -1.0, 1.0))
+       #
+       # Convergence correction: the image slope of a ground line depends
+       # on WHERE the line is laterally — every line parallel to the car
+       # converges at the vanishing point, so a line ridden at an offset
+       # (lane driving) leans in the image even when the car is perfectly
+       # aligned with it. Riding ~60px beside the yellow faked a ~0.35
+       # heading, and the controller "fixed" that lean by drifting back
+       # toward the line — the lane offset never held its width (the
+       # "hugs the dashed line" bug). Verified on sessions 12-15: heading
+       # vs lateral position slope ~-0.006/px, exactly the vanishing-point
+       # prediction, implied horizon 59% down the frame (measured ~55%).
+       # So subtract the slope a parallel line WOULD have at this lateral
+       # position: a_exp = (x - vp_x) / (rows between horizon and bottom).
+       vp_x = (w / 2.0) if self.target_x is None else float(self.target_x)
+       a_exp = (x_near - vp_x) / max(h * (1.0 - self.vp_y_frac), 1.0)
+       heading = float(np.clip(-(a - a_exp) * roi_h / (w / 2.0), -1.0, 1.0))
 
 
        self.frames_since_fix = 0
@@ -692,13 +1023,51 @@ class LineFollower:
    # ------------------------------------------------------------------ #
    # white-line fallback helpers                                        #
    # ------------------------------------------------------------------ #
-   def _split_whites(self, white_pts, yellow_fit):
+   def _cluster_bottom_x(self, pts, roi_h, w):
        """
-       Split white-line band centroids into left/right of the yellow line
-       (using the yellow fit when available, else the last known yellow x)
-       and return the nearest-to-car x of each side plus per-side fits.
+       Project a white cluster's centroids to the ROI bottom, the same way
+       the yellow is projected. Lane distances must compare line positions
+       AT THE SAME image row: band centroids sit mid-ROI where perspective
+       has already narrowed the lane, so the raw centroid average
+       understated the distances by ~30% (learned 76/88px vs a true
+       106/128 at the bottom row on sessions 12-15) — and the commanded
+       lane offset came out equally short. Falls back to the near-centroid
+       average, which also clamps the fit's extrapolation exactly like the
+       yellow's projection.
        """
-       left, right = [], []
+       arr = np.array(pts, dtype=np.float64)
+       cxs, cys, ws = arr[:, 0], arr[:, 1], arr[:, 2]
+       order = np.argsort(cys)[::-1]
+       sel = order[:3]
+       near = float(np.average(cxs[sel], weights=ws[sel]))
+       if len(pts) < 2 or np.ptp(cys) < 1e-6:
+           return near
+       wgt = ws * (0.5 + cys / roi_h)
+       a, b = np.polyfit(cys, cxs, 1, w=np.sqrt(wgt))
+       xb = float(a * roi_h + b)
+       return near + float(np.clip(xb - near, -0.15 * w, 0.15 * w))
+
+   def _split_whites(self, white_pts, yellow_fit, w, roi_h):
+       """
+       Group white-line band centroids into distinct LINES on each side of
+       the yellow (using the yellow fit when available, else the last known
+       yellow x) and return, per side, the bottom-projected x of the line
+       closest to the yellow plus a flag saying whether that line was seen
+       in the near field (bottom half of the ROI) — only near-field
+       sightings are allowed to teach lane widths.
+
+       The track has more white than the two lane boundaries: a second
+       parallel line to the right, markings, and neighboring-track paint.
+       All of it lands in white_pts. The old average-everything-per-side
+       blended those lines into a distance matching none of them (replayed
+       learned distances wandered 66..166px vs a true ~85/~108). So the
+       per-side centroids are clustered by their x-offset from the yellow
+       fit (gaps over LF_WHITE_CLUSTER_FRAC split clusters), clusters whose
+       median offset is outside the plausible lane-distance range are
+       dropped, and only the surviving cluster nearest the yellow — the
+       actual lane boundary — is used.
+       """
+       off = []                       # (dx from yellow, cx, cy, weight)
        for cx, cy, n in white_pts:
            if yellow_fit is not None:
                a, b = yellow_fit
@@ -706,48 +1075,128 @@ class LineFollower:
            elif self.last_x is not None:
                ref = self.last_x
            else:
-               ref = None
-           if ref is None:
                continue
-           (left if cx < ref else right).append((cx, cy, n))
+           off.append((cx - ref, cx, cy, n))
+
+       lo, hi = self.lane_dist_min_frac * w, self.lane_dist_max_frac * w
+       gap = self.white_cluster_frac * w
 
        def near_x(side):
            if len(side) < self.white_min_bands:
-               return None
-           arr = np.array(side, dtype=np.float64)
-           # nearest-to-car centroids dominate, same reasoning as the yellow
-           order = np.argsort(arr[:, 1])[::-1]
-           sel = arr[order[:3]]
-           return float(np.average(sel[:, 0], weights=sel[:, 2]))
+               return None, []
+           side = sorted(side)                     # by dx
+           clusters, cur = [], [side[0]]
+           for p in side[1:]:
+               if p[0] - cur[-1][0] > gap:
+                   clusters.append(cur)
+                   cur = [p]
+               else:
+                   cur.append(p)
+           clusters.append(cur)
+           best = None
+           for cl in clusters:
+               if len(cl) < self.white_min_bands:
+                   continue
+               d = abs(float(np.median([p[0] for p in cl])))
+               if not (lo < d < hi):
+                   continue
+               if best is None or d < abs(float(np.median([p[0] for p in best]))):
+                   best = cl
+           if best is None:
+               return None, False
+           pts = [(p[1], p[2], p[3]) for p in best]
+           # a cluster observed only far up the ROI anchors its bottom
+           # projection poorly — extrapolation from upper-row clutter is
+           # how session 13 learned dist_l=153 (curb + pavement-seam
+           # pixels). Such a fix may still bridge a dropout, but teaching
+           # lane widths takes a sighting reaching LF_LANE_LEARN_NEAR_FRAC
+           # of the ROI.
+           near_ok = max(p[1] for p in pts) >= self.learn_near_frac * roi_h
+           return self._cluster_bottom_x(pts, roi_h, w), near_ok
 
-       return near_x(left), near_x(right), left, right
+       wl, wl_ok = near_x([p for p in off if p[0] < 0])
+       wr, wr_ok = near_x([p for p in off if p[0] >= 0])
+       return wl, wr, wl_ok, wr_ok
 
    def _learn_lane(self, x_yellow, wl, wr, w):
-       """EMA the yellow-to-white distance on each side while tracking.
-       Samples outside the plausible range (LF_LANE_DIST_*_FRAC) are
-       misclassified speckles or a neighboring track's line — skip them."""
-       lo, hi = self.lane_dist_min_frac * w, self.lane_dist_max_frac * w
+       """Learn the yellow-to-white distance on each side while tracking.
+       Both inputs are bottom-projected, so this is the lane width AT THE
+       CAR — the row where the steering error lives. Samples outside the
+       plausible range (LF_LANE_DIST_BOT_MIN_FRAC..LF_LANE_DIST_MAX_FRAC)
+       are misclassified speckles or a neighboring track's line — skip
+       them. The estimate is the median of a ring of recent samples: an
+       EMA let every junk sample through (each nudged it 10%, and
+       stretches of junk walked it anywhere); a median needs a majority of
+       the window to be wrong before it moves, yet still tracks slow real
+       change. Requiring several samples before publishing keeps the lane
+       offset from engaging off one glimpse. The caller additionally
+       freezes learning while turning: mid-turn the projected geometry is
+       chord-vs-arc distorted (measured 177/102 vs 106/128 straight), and
+       letting those samples in dragged the target 30-50px toward the
+       yellow exactly in corners — which is what pushed the car across
+       the center line into the wrong lane on turns."""
+       lo, hi = self.lane_dist_bot_min_frac * w, self.lane_dist_max_frac * w
        if wl is not None and lo < x_yellow - wl < hi:
-           d = x_yellow - wl
-           self.dist_left = d if self.dist_left is None else 0.9 * self.dist_left + 0.1 * d
+           self._dl_buf.append(x_yellow - wl)
+           if len(self._dl_buf) >= 8:
+               self.dist_left = float(np.median(self._dl_buf))
        if wr is not None and lo < wr - x_yellow < hi:
-           d = wr - x_yellow
-           self.dist_right = d if self.dist_right is None else 0.9 * self.dist_right + 0.1 * d
+           self._dr_buf.append(wr - x_yellow)
+           if len(self._dr_buf) >= 8:
+               self.dist_right = float(np.median(self._dr_buf))
 
    def _estimate_from_whites(self, wl, wr):
        """
-       Estimate where the yellow line is from the white lines and the
-       learned per-side distances. Returns x estimate or None.
+       Estimate where the yellow line is from the white lines and the lane
+       width (calibrated LF_LANE_WIDTH_PX, else the learned per-side
+       distances). Returns x estimate or None.
        """
-       est = []
-       if wl is not None and self.dist_left is not None:
-           est.append(wl + self.dist_left)
-       if wr is not None and self.dist_right is not None:
-           est.append(wr - self.dist_right)
-       if not est:
-           return None
-       return float(np.mean(est))
+       dl = self.lane_width_l if self.lane_width_l is not None else self.dist_left
+       dr = self.lane_width_r if self.lane_width_r is not None else self.dist_right
+       est_l = wl + float(dl) if wl is not None and dl is not None else None
+       est_r = wr - float(dr) if wr is not None and dr is not None else None
+       # When lane-offset driving, trust only the NEAR boundary (the one
+       # the car rides beside): it is close, solid, and unambiguous. The
+       # far side of a stale yellow reference is where misclassified
+       # clusters live (second parallel line, the other lane's boundary),
+       # and averaging a wrong hypothesis in drags the estimate a half
+       # lane sideways exactly during blind turns.
+       if self._lane_applied <= -0.25:
+           est = est_l if est_l is not None else est_r
+       elif self._lane_applied >= 0.25:
+           est = est_r if est_r is not None else est_l
+       elif est_l is not None and est_r is not None:
+           est = 0.5 * (est_l + est_r)
+       else:
+           est = est_l if est_l is not None else est_r
+       return None if est is None else float(est)
 
+
+   # ------------------------------------------------------------------ #
+   # vision gyro                                                        #
+   # ------------------------------------------------------------------ #
+   def _measure_yaw_rate(self, rgb_img, dt):
+       """
+       Camera yaw rate from the frame-to-frame horizontal shift of the
+       far background (see LF_GYRO_GAIN). Positive = yawing right.
+       Returns 0.0 when there is nothing trackable (first frame, heavy
+       blur, an occluder filling the strip): zero damping is the safe
+       degradation, the PID still runs.
+       """
+       h, w = rgb_img.shape[:2]
+       y0, y1 = int(self.gyro_strip[0] * h), int(self.gyro_strip[1] * h)
+       strip = cv2.cvtColor(rgb_img[y0:y1], cv2.COLOR_RGB2GRAY).astype(np.float32)
+       prev, self._gyro_prev = self._gyro_prev, strip
+       if prev is None or prev.shape != strip.shape:
+           self._gyro_win = cv2.createHanningWindow(
+               (strip.shape[1], strip.shape[0]), cv2.CV_32F)
+           return 0.0
+       (dx, _dy), resp = cv2.phaseCorrelate(prev, strip, self._gyro_win)
+       if resp < 0.1:
+           return 0.0   # no dominant shift peak — strip content unusable
+       # scene shifts LEFT when the car yaws RIGHT; f = w/2 / tan(HFOV/2)
+       f = (w / 2.0) / np.tan(np.radians(self.cam_hfov) / 2.0)
+       return float(np.clip(-dx / f / max(dt, 1e-3), -4.0, 4.0))
 
    # ------------------------------------------------------------------ #
    # control                                                            #
@@ -758,16 +1207,53 @@ class LineFollower:
        target = (w / 2.0) if self.target_x is None else float(self.target_x)
        # The offset shifts where the yellow should SIT in the frame, opposite
        # to where the car goes: to drive over the RIGHT lane (+offset) the
-       # yellow must appear LEFT of center by that fraction of the learned
-       # yellow-to-white distance.
-       if self.lane_offset > 0 and self.dist_right is not None:
-           target -= self.lane_offset * self.dist_right
-       elif self.lane_offset < 0 and self.dist_left is not None:
-           target -= self.lane_offset * self.dist_left
+       # yellow must appear LEFT of center by that fraction of the lane
+       # width (LF_LANE_WIDTH_PX when calibrated, else the learned per-side
+       # distance). _lane_applied is the RAMPED offset maintained in run(),
+       # so engaging doesn't step the target sideways.
+       if self._lane_applied > 0:
+           dist = self.lane_width_r if self.lane_width_r is not None \
+               else self.dist_right
+           if dist is not None:
+               target -= self._lane_applied * float(dist)
+       elif self._lane_applied < 0:
+           dist = self.lane_width_l if self.lane_width_l is not None \
+               else self.dist_left
+           if dist is not None:
+               target -= self._lane_applied * float(dist)
        err = (x_line - target) / (w / 2.0)
        if self.deadband > 0:
            err = np.sign(err) * max(0.0, abs(err) - self.deadband)
        return float(np.clip(err, -1.0, 1.0)), target
+
+   def _alpha(self, dt, tc):
+       """EMA coefficient for time constant tc at time step dt."""
+       return 1.0 if tc <= 0 else 1.0 - float(np.exp(-dt / tc))
+
+   def _update_filters(self, x, heading, now, dt):
+       """EMA the raw measurements before the PID sees them (see the
+       LF_STEER_KP retune note). After a gap with no updates the filter
+       state is stale — reseed instead of dragging the estimate over."""
+       stale = self._filt_time is None or (now - self._filt_time) > 0.5
+       self._filt_time = now
+       if stale or self.x_f is None:
+           self.x_f = float(x)
+           self.d_f = 0.0
+           self.prev_error = None
+       else:
+           self.x_f += self._alpha(dt, self.x_tc) * (x - self.x_f)
+       if heading is not None:
+           if stale or self.h_f is None:
+               self.h_f = float(heading)
+           else:
+               self.h_f += self._alpha(dt, self.h_tc) * (heading - self.h_f)
+
+   def _apply_steering(self, steer, dt):
+       """Clip and slew-limit (LF_STEER_SLEW) the steering command."""
+       steer = float(np.clip(steer, -1.0, 1.0))
+       lim = self.steer_slew * dt
+       self.steering = float(np.clip(steer, self.steering - lim,
+                                     self.steering + lim))
 
    def run(self, cam_img):
        if cam_img is None:
@@ -782,43 +1268,159 @@ class LineFollower:
 
 
        now = time.time()
+       dt = 0.05 if self._t_prev is None else \
+           float(np.clip(now - self._t_prev, 1e-3, 0.2))
+       self._t_prev = now
        h, w = cam_img.shape[:2]
-       found, x_near, heading, debug = self.detect(cam_img)
 
-       yellow_fit = debug.get('fit')
+       # vision gyro: yaw-rate damping signal (see LF_GYRO_GAIN). The
+       # _sim_yaw_rate hook lets the closed-loop sim inject its model's
+       # yaw rate while detect() is stubbed out.
+       if self.gyro_gain != 0.0:
+           yr = getattr(self, '_sim_yaw_rate', None)
+           if yr is None:
+               yr = self._measure_yaw_rate(cam_img, dt)
+           self.yaw_rate_f += self._alpha(dt, self.gyro_tc) * (yr - self.yaw_rate_f)
+           if self.gyro_washout_tc > 0:
+               self._gyro_slow += self._alpha(dt, self.gyro_washout_tc) \
+                   * (self.yaw_rate_f - self._gyro_slow)
+           else:
+               self._gyro_slow = 0.0
+       damp = -self.gyro_gain * (self.yaw_rate_f - self._gyro_slow)
+
+       found, x_meas, heading, debug = self.detect(cam_img)
+
+       # Temporal consistency gate (see LF_TEMPORAL_JUMP): a fix that
+       # teleports relative to the last ACCEPTED fix — beyond what the
+       # measured yaw rate explains — is clutter wearing the line's
+       # colors, not the line. Treat the frame as a dropout; the coast /
+       # white-guided path rides through it. The allowance widens each
+       # consecutive rejection, and after LF_TEMPORAL_MAX_REJECT the fix
+       # is accepted unconditionally (with filters reseeded) so a stale
+       # last position can never lock the detector out for good.
+       if (found and self.last_x is not None
+               and self.last_heading is not None
+               and self._filt_time is not None
+               and now - self._filt_time <= 0.5):
+           n = self._suspect_streak
+           f_px = (w / 2.0) / np.tan(np.radians(self.cam_hfov) / 2.0)
+           gap = now - self._filt_time
+           pred_x = self.last_x - f_px * self.yaw_rate_f * gap
+           bad_x = abs(x_meas - pred_x) > self.temporal_jump * w * (1 + n)
+           bad_h = abs(heading - self.last_heading) \
+               > self.temporal_h_jump * (1 + n)
+           if (bad_x or bad_h) and n < self.temporal_max_reject:
+               self._suspect_streak = n + 1
+               found = False
+           else:
+               if n >= self.temporal_max_reject:
+                   self._filt_time = None   # long fight: reseed filters
+               self._suspect_streak = 0
+       elif found:
+           self._suspect_streak = 0
+
+       # While the yellow is unseen (dropout, off-frame in a lane-offset
+       # turn, temporal-gate rejection), dead-reckon its image position
+       # with the vision gyro: the reference that the white-line side
+       # split and the guidance sanity gate compare against must keep
+       # turning with the car, or a long blind curve walks the true line
+       # straight out of the gate — session 36 lost the yellow for 2s in
+       # a bend and coasted to a stop with a valid white in view because
+       # the frozen reference no longer matched the scene.
+       if not found and self.last_x is not None and self.gyro_gain != 0.0:
+           f_px = (w / 2.0) / np.tan(np.radians(self.cam_hfov) / 2.0)
+           self.last_x = float(self.last_x - f_px * self.yaw_rate_f * dt)
+
+       # a fit that failed the temporal gate is a phantom — never hand it
+       # to the white-line side split as the yellow reference
+       yellow_fit = debug.get('fit') if found else None
        wl = wr = None
+       wl_ok = wr_ok = False
        if self.white_enabled and debug['white_pts']:
-           wl, wr, _, _ = self._split_whites(debug['white_pts'], yellow_fit)
+           roi_h = h - debug['roi_y0']
+           wl, wr, wl_ok, wr_ok = self._split_whites(
+               debug['white_pts'], yellow_fit, w, roi_h)
            debug['wl'], debug['wr'] = wl, wr
 
+       # Ramp the lane offset toward its setpoint once the lane width it
+       # needs is available (immediately when LF_LANE_WIDTH_PX is set,
+       # else once the needed side has been learned).
+       want = 0.0
+       if self.lane_offset > 0 and (self.lane_width_r is not None
+                                    or self.dist_right is not None):
+           want = self.lane_offset
+       elif self.lane_offset < 0 and (self.lane_width_l is not None
+                                      or self.dist_left is not None):
+           want = self.lane_offset
+       step = dt / max(self.lane_ramp_sec, 1e-3)
+       self._lane_applied += float(np.clip(want - self._lane_applied,
+                                           -step, step))
+
        if found:
-           self._learn_lane(x_near, wl, wr, w)
-           self.last_x = x_near
-           error, target = self._steer_error(x_near, w)
+           # learn lane widths on straight-ish frames only (see _learn_lane),
+           # and only from clusters observed in the near field (wl_ok/wr_ok)
+           if (self.h_f is None
+                   or abs(self.h_f - self.h_bias) <= self.learn_max_heading):
+               self._learn_lane(x_meas, wl if wl_ok else None,
+                                wr if wr_ok else None, w)
+           self.last_x = x_meas
+           self.last_heading = heading
+           self._update_filters(x_meas, heading, now, dt)
+           error, target = self._steer_error(self.x_f, w)
+           self.last_err = error
            debug['target'] = target
 
 
-           # PID + heading feed-forward
-           d_err = 0.0
-           if self.prev_error is not None and self.prev_time is not None:
-               dt = max(now - self.prev_time, 1e-3)
-               d_err = (error - self.prev_error) / dt
-               # Integrate only while tracking, with dt clamped so a frame
-               # hiccup can't spike the sum, and frozen while the output is
-               # already saturated toward the error (classic anti-windup).
-               if abs(self.steering) < 1.0 or np.sign(self.steering) != np.sign(error):
+           # PID + heading feedback, on the FILTERED measurements
+           hterm = float(np.clip(self.h_f - self.h_bias,
+                                 -self.h_clip, self.h_clip))
+           if self.prev_error is not None:
+               # derivative of the filtered error, then low-passed again —
+               # the raw one-frame difference at 20 Hz was the largest
+               # single steering contributor, and it was all noise
+               raw_d = (error - self.prev_error) / dt
+               self.d_f += self._alpha(dt, self.d_tc) * (raw_d - self.d_f)
+               # The integrator is a TRIM estimator: it updates only while
+               # driving near-straight (trim is unobservable in a curve —
+               # the sustained error there is curvature) with a small error
+               # (a big one is a transient we're still converging out of),
+               # with dt clamped so a frame hiccup can't spike the sum, and
+               # frozen while the output is already saturated toward the
+               # error (classic anti-windup). Letting it wind in curves is
+               # what S-swerved every post-curve straight and pushed the
+               # car back across the yellow when lane-offset driving.
+               if ((abs(self.steering) < 1.0
+                        or np.sign(self.steering) != np.sign(error))
+                       and abs(hterm) <= self.i_h_gate
+                       and abs(error) <= self.i_err_gate):
                    self.i_term = float(np.clip(
                        self.i_term + self.ki * error * min(dt, 0.2),
                        -self.i_max, self.i_max))
-           self.prev_error, self.prev_time = error, now
+           self.prev_error = error
 
 
-           steer = self.kp * error + self.kd * d_err + self.i_term + self.kh * heading
-           self.steering = float(np.clip(steer, -1.0, 1.0))
+           # slow curve feed-forward: sustained lean carries the bend
+           # (see LF_CURVE_GAIN); the fast part stays at kh. Attack is
+           # slow (only a SUSTAINED lean counts as a curve) but release is
+           # fast: when the lean collapses or flips sign the bend is over
+           # — an S-transition holding the old boost for its full time
+           # constant blows the car wide into the new bend.
+           tc = self.curve_tc
+           if hterm * self.h_slow < 0 or abs(hterm) < 0.5 * abs(self.h_slow):
+               tc = self.curve_tc / 5.0
+           self.h_slow += self._alpha(dt, tc) * (hterm - self.h_slow)
+           steer = (self.kp * error + self.kd * self.d_f
+                    + self.i_term + self.kh * hterm
+                    + self.curve_gain * self.h_slow + damp)
+           self._apply_steering(steer, dt)
 
 
-           # slow down proportionally to how hard we're steering
-           self.throttle = self.th_max - (self.th_max - self.th_min) * abs(self.steering)
+           # Slow down proportionally to how hard we're steering — and to
+           # how hard the line ahead is BENDING: heading rises at a curve's
+           # entry before the steering has wound up, so keying the throttle
+           # off it too sheds speed going in, not halfway around.
+           slow = min(1.0, max(abs(self.steering), abs(hterm) / max(self.h_clip, 1e-6)))
+           self.throttle = self.th_max - (self.th_max - self.th_min) * slow
            self.status = "tracking"
            self.lost_frames = 0
            self.lost_since = None
@@ -830,6 +1432,29 @@ class LineFollower:
            x_est = None
            if self.white_enabled and now - self.lost_since <= self.white_guide_sec:
                x_est = self._estimate_from_whites(wl, wr)
+           # Sanity-gate the white estimate against the last known line
+           # position: _split_whites sides its clusters off the (possibly
+           # stale or misfit) yellow reference, and one wrong-side call
+           # turns "left white + lane width" into an estimate a full lane
+           # out — session 18 replay shows x_est=-64 from exactly that,
+           # which commanded a hard-left excursion until the stop timer
+           # fired. The line cannot teleport: a guided estimate must land
+           # near where the (gyro-dead-reckoned) yellow reference is, with
+           # the allowance growing the longer we've been blind but never
+           # past a third of the frame. NOT widened by heading like the
+           # single-dash gate — the misfits that poison the side split
+           # happen precisely mid-turn, so a heading widening opens the
+           # gate exactly when it must hold. Deliberately NO absolute
+           # in-frame bound: in a lane-offset turn the yellow genuinely
+           # leaves the frame, and an off-frame estimate (wl + lane width
+           # > image width) is the CORRECT virtual target — an earlier
+           # in-frame check here silently discarded 2s of valid white
+           # guidance in session 36 and let the car coast to a stop.
+           if x_est is not None and self.last_x is not None:
+               grow = min(1.0 + 2.0 * (now - self.lost_since), 2.5)
+               allow = min(self.single_dash_max_jump * w * grow, 0.33 * w)
+               if abs(x_est - self.last_x) > allow:
+                   x_est = None
            if x_est is not None:
                # Yellow gone (dash gap, worn paint, deep shadow) but the
                # solid white lines are visible: steer from them. Only for
@@ -838,27 +1463,61 @@ class LineFollower:
                # white edges alone. The lost clock keeps running so the
                # coast/stop logic takes over when the window expires. No D
                # term across the mode switch — the error source changed.
+               # The estimate still feeds the x filter, so the handback to
+               # yellow tracking is seamless on both ends.
                self.last_x = x_est
-               error, target = self._steer_error(x_est, w)
+               self._update_filters(x_est, None, now, dt)
+               error, target = self._steer_error(self.x_f, w)
+               self.last_err = error
                debug['target'] = target
                debug['x_est'] = x_est
                self.prev_error = None
+               self.d_f = 0.0
                # keep applying the learned trim (i_term) but don't update it
-               # from white-line estimates — the error source changed
-               steer = self.kp * error + self.i_term
-               self.steering = float(np.clip(steer, -1.0, 1.0))
+               # from white-line estimates — the error source changed.
+               # ALSO keep the last tracked heading feed-forward (h_f is
+               # frozen while the yellow is lost): 61% of yellow dropouts
+               # happen mid-turn, and dropping the heading term here
+               # straightened the car exactly when it needed to hold its
+               # arc — it then re-found the line having drifted a lane over.
+               hterm = 0.0
+               if self.h_f is not None:
+                   hterm = float(np.clip(self.h_f - self.h_bias,
+                                         -self.h_clip, self.h_clip))
+               # NO curve term while blind: h_slow is frozen here, and the
+               # field-tuned LF_CURVE_GAIN is negative on this track — fed
+               # with the frozen mid-turn lean it would actively steer
+               # AGAINST completing the turn, which is the last thing a
+               # blind car in a bend needs. kh * hterm alone is the
+               # validated "hold the arc" feed-forward.
+               steer = self.kp * error + self.i_term + self.kh * hterm + damp
+               self._apply_steering(steer, dt)
                self.throttle = self.th_min
                self.status = "white-guided"
                self.lost_frames = 0
+               self._last_guided = now
            else:
                self.lost_frames += 1
                self.prev_error = None
 
 
-               if now - self.lost_since > self.lost_stop_sec:
+               # The give-up clock measures time since the car was last
+               # STEERED BY A MEASUREMENT — yellow fix or white guidance —
+               # not since the last yellow. It used to run from the first
+               # yellow loss only: in session 36 the car was actively
+               # white-guiding through a blind bend for 2s, then a single
+               # scattered (gate-rejected) estimate tripped an instant
+               # hard stop because the yellow-loss clock had already
+               # expired underneath the working guidance.
+               guided = getattr(self, '_last_guided', 0.0)
+               if min(now - self.lost_since, now - guided) > self.lost_stop_sec:
                    # lost for too long — stop rather than wander off the track
                    self.steering, self.throttle = 0.0, 0.0
                    self.i_term = 0.0   # relearn trim on the next acquisition
+                   self.x_f = self.h_f = None   # stale after a stop; reseed
+                   self.d_f = 0.0
+                   self.h_slow = 0.0
+                   self._lane_applied = 0.0     # re-ramp the lane offset too
                    self.status = "stopped (line lost)"
                else:
                    # dropout (dash gap or momentary occlusion): hold the last
@@ -927,9 +1586,11 @@ class LineFollower:
            dl = f"{self.dist_left:.0f}" if self.dist_left is not None else "?"
            dr = f"{self.dist_right:.0f}" if self.dist_right is not None else "?"
            lane = f" lane:{dl}/{dr}"
+       if self._lane_applied != 0.0:
+           lane += f" off:{self._lane_applied:+.2f}"
        for i, s in enumerate([
            f"st:{self.steering:+.2f} th:{self.throttle:.2f} i:{self.i_term:+.2f}",
-           f"hdg:{heading:+.2f}{lane}",
+           f"e:{self.last_err:+.2f} hdg:{heading:+.2f}{lane}",
            self.status,
        ]):
            cv2.putText(img, s, (4, 12 + 12 * i), cv2.FONT_HERSHEY_SIMPLEX,
@@ -990,10 +1651,14 @@ def _test(paths, out_dir="lf_out"):
 
 def _calibrate(path):
    """
-   Measure LF_TARGET_X from a frame taken with the car parked so its
-   centerline sits EXACTLY over the yellow line. Whatever x the line reads
-   in that frame is, by construction, where the line should sit whenever
-   the car is centered on it — regardless of how the camera is mounted.
+   Measure LF_TARGET_X and LF_HEADING_BIAS from a frame taken with the car
+   parked so its centerline sits EXACTLY over the yellow line, pointing
+   straight along it. Whatever x the line reads in that frame is, by
+   construction, where the line should sit whenever the car is centered on
+   it — regardless of how the camera is mounted. Likewise, whatever
+   heading the fit reads while physically aligned is pure camera yaw /
+   perspective bias, which would otherwise be a constant steering push
+   the integrator has to fight (the 2026-07-23 sessions measured +0.12).
    """
    bgr = cv2.imread(path)
    if bgr is None:
@@ -1012,7 +1677,10 @@ def _calibrate(path):
    off = lf.last_x - w / 2.0
    print(f"line at x={lf.last_x:.1f}, image center {w / 2.0:.1f} "
          f"(camera offset {off:+.1f}px in {w}-wide coords)")
+   print(f"measured heading {lf.last_heading:+.3f} "
+         f"(only valid if the car was parked pointing straight along the line)")
    print(f"add to myconfig.py:  LF_TARGET_X = {lf.last_x:.0f}")
+   print(f"add to myconfig.py:  LF_HEADING_BIAS = {lf.last_heading:.2f}")
 
 
 
