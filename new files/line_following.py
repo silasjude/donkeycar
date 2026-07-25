@@ -237,6 +237,38 @@ DEFAULTS = dict(
    # (largest bbox side, as a fraction of ROI height) to count.
    LF_WHITE_MIN_AREA_FRAC=0.001,
    LF_WHITE_MIN_EXTENT=0.2,
+   # --- near-white tracker (primary reference for lane-offset driving) ---
+   # Session 38 (-0.75, the "still gets lost on left-lane turns" runs)
+   # settled the architecture: in the three episodes that ended in a
+   # stop, the near white line was DETECTED in 92-97% of frames, but the
+   # estimate chain (side-split against the last yellow position, then
+   # sanity gates) accepted almost none of it — the yellow reference the
+   # chain leans on is exactly what a blind bend doesn't have. So for
+   # |lane offset| >= 0.25 the near boundary gets its own persistent
+   # tracker: every frame its cluster is matched against the TRACKER'S
+   # OWN previous position (gyro-compensated; falling back to where the
+   # boundary belongs in ego frame), and its position AND heading are
+   # filtered exactly like the yellow's. When the yellow drops out the
+   # controller steers directly on this tracker — with LIVE heading
+   # feedback through the whole arc, not a frozen snapshot. The solid
+   # white has no dash gaps: if it's in view, this tracks it.
+   LF_WHITE_TRACK=True,        # enable the tracker (lane-offset only)
+   LF_WHITE_TRACK_JUMP=0.12,   # per-frame match allowance, fraction of
+                               # image width (plus the gyro-predicted
+                               # shift, added automatically)
+   LF_WHITE_TRACK_FRESH=0.35,  # seconds; tracker older than this stops
+                               # steering (falls back to the estimate
+                               # chain / coast)
+
+   # In a bend, a straight fit through the CURVING white line projects to
+   # the frame bottom along the chord, systematically toward the inside
+   # of the curve — session 37 measured the near-white 40-70px low in a
+   # right-hander, so the white-based yellow estimate landed left of the
+   # lane target and the car "steered back" out of its own turn. The
+   # frozen heading is a curvature proxy, so shift the estimate by this
+   # fraction of the image width per unit of (heading - bias). 0 disables.
+   LF_WHITE_CHORD_COMP=0.18,
+
    # White guidance bridges stretches without yellow: dash gaps, worn or
    # deeply shadowed paint — and, in lane-offset driving, whole TURNS
    # (riding -0.75, the yellow regularly exits the frame for the entire
@@ -364,7 +396,7 @@ DEFAULTS = dict(
    LF_STEER_I_ERR_GATE=0.25,  # ...and |error| below this (a big error means
                            # we're actively converging on the line/lane —
                            # integrating the transient just adds overshoot)
-   LF_HEADING_GAIN=0.4,    # extra steering from the line's slope. NOTE
+   LF_HEADING_GAIN=0.3,    # extra steering from the line's slope. NOTE
                            # (2026-07-24, identified from footage): this is
                            # NOT a damping term. A small camera yaw
                            # translates the line in the image without
@@ -466,10 +498,22 @@ DEFAULTS = dict(
    # TRACKING; blind (white-guided) turns exclude this term on purpose —
    # a negative gain fed the frozen mid-turn lean would steer against
    # completing the turn.
-   LF_CURVE_GAIN=-0.8,     # steering per unit of slow heading lean
+   LF_CURVE_GAIN=-0.5,     # steering per unit of slow heading lean
    LF_CURVE_TC=0.7,        # seconds; EMA defining "sustained". Shorter =
                            # quicker to full curve hold but more of the
                            # heading noise leaks into this high-gain path.
+   # A PEGGED heading (|hterm| at ~the clip) means the line is sweeping
+   # out of the frame: the bend is real, immediate, and about to blind
+   # the car — whatever the curve-gain trim is doing on moderate bends,
+   # refusing to steer WITH a pegged heading guarantees losing the line.
+   # Session 38, sharp right-hander at the building entrance: heading
+   # +1.0, error positive, and the field-tuned NEGATIVE curve gain
+   # cancelled the whole heading response — net command ~0, car went
+   # straight into the breezeway. When |hterm| >= 0.9*LF_HEADING_CLIP,
+   # the combined heading response (kh*hterm + curve_gain*h_slow) is
+   # floored at this magnitude, same sign as the lean. Moderate bends
+   # are untouched.
+   LF_SHARP_BEND_MIN=0.5,
 
    LF_GYRO_GAIN=0.3,       # steering per rad/s of yaw (sim-tuned on the
                            # identified plant; the win is biggest exactly
@@ -619,6 +663,10 @@ class LineFollower:
        self.white_min_area_frac = float(_cfg(cfg, 'LF_WHITE_MIN_AREA_FRAC'))
        self.white_min_extent = float(_cfg(cfg, 'LF_WHITE_MIN_EXTENT'))
        self.white_guide_sec = float(_cfg(cfg, 'LF_WHITE_GUIDE_SEC'))
+       self.chord_comp = float(_cfg(cfg, 'LF_WHITE_CHORD_COMP'))
+       self.white_track = bool(_cfg(cfg, 'LF_WHITE_TRACK'))
+       self.white_track_jump = float(_cfg(cfg, 'LF_WHITE_TRACK_JUMP'))
+       self.white_track_fresh = float(_cfg(cfg, 'LF_WHITE_TRACK_FRESH'))
        self.lane_dist_min_frac = float(_cfg(cfg, 'LF_LANE_DIST_MIN_FRAC'))
        self.lane_dist_max_frac = float(_cfg(cfg, 'LF_LANE_DIST_MAX_FRAC'))
        self.lane_dist_bot_min_frac = float(_cfg(cfg, 'LF_LANE_DIST_BOT_MIN_FRAC'))
@@ -648,6 +696,7 @@ class LineFollower:
        self.i_err_gate = float(_cfg(cfg, 'LF_STEER_I_ERR_GATE'))
        self.curve_gain = float(_cfg(cfg, 'LF_CURVE_GAIN'))
        self.curve_tc = float(_cfg(cfg, 'LF_CURVE_TC'))
+       self.sharp_bend_min = float(_cfg(cfg, 'LF_SHARP_BEND_MIN'))
        self.gyro_gain = float(_cfg(cfg, 'LF_GYRO_GAIN'))
        self.gyro_tc = float(_cfg(cfg, 'LF_GYRO_FILTER_TC'))
        self.gyro_washout_tc = float(_cfg(cfg, 'LF_GYRO_WASHOUT_TC'))
@@ -709,6 +758,9 @@ class LineFollower:
        self._suspect_streak = 0 # consecutive fixes rejected by the temporal gate
        self.h_slow = 0.0        # sustained heading lean (curve feed-forward)
        self._last_guided = 0.0  # wall time of the last white-guided steer
+       self.white_x_f = None    # near-white tracker: filtered bottom x
+       self.white_h_f = None    # near-white tracker: filtered heading
+       self._white_seen = None  # wall time the tracker last matched a cluster
        self._gyro_prev = None   # previous far-field strip (float32 gray)
        self._gyro_win = None    # Hanning window for phaseCorrelate
 
@@ -1198,6 +1250,149 @@ class LineFollower:
        f = (w / 2.0) / np.tan(np.radians(self.cam_hfov) / 2.0)
        return float(np.clip(-dx / f / max(dt, 1e-3), -4.0, 4.0))
 
+   def _ego_near_boundary(self, white_pts, w, roi_h):
+       """
+       Identify the lane's NEAR white boundary without any yellow
+       reference, from where it SHOULD be relative to the car.
+
+       _split_whites sides its clusters off the last yellow position;
+       when the car has been blind through most of a bend that reference
+       is stale garbage and every real cluster gets rejected (session
+       37: reference dead-reckoned past x=700, whites in view, zero
+       clusters accepted for 2s, car stopped mid-track). But while
+       lane-offset driving we know where the near boundary belongs in
+       EGO coordinates — riding -0.75 of a 170px lane puts the left
+       white ~42px left of the car's own column — so cluster the white
+       centroids by x alone and take the cluster whose bottom projection
+       lands nearest that expectation. Returns (wl, wr) with only the
+       near side filled, or (None, None).
+       """
+       if abs(self._lane_applied) < 0.25 or not white_pts:
+           return None, None
+       if self._lane_applied < 0:
+           width = self.lane_width_l if self.lane_width_l is not None \
+               else self.dist_left
+       else:
+           width = self.lane_width_r if self.lane_width_r is not None \
+               else self.dist_right
+       if width is None:
+           return None, None
+       target_yellow = (w / 2.0 if self.target_x is None
+                        else float(self.target_x)) \
+           - self._lane_applied * float(width)
+       if self._lane_applied < 0:
+           expect = target_yellow - float(width)
+       else:
+           expect = target_yellow + float(width)
+       pts = sorted(white_pts)                       # by cx
+       gap = self.white_cluster_frac * w
+       clusters, cur = [], [pts[0]]
+       for p in pts[1:]:
+           if p[0] - cur[-1][0] > gap:
+               clusters.append(cur)
+               cur = [p]
+           else:
+               cur.append(p)
+       clusters.append(cur)
+       best, best_d = None, 0.2 * w   # must land within 0.2w of expectation
+       for cl in clusters:
+           if len(cl) < self.white_min_bands:
+               continue
+           bx = self._cluster_bottom_x(cl, roi_h, w)
+           if abs(bx - expect) < best_d:
+               best, best_d = bx, abs(bx - expect)
+       if best is None:
+           return None, None
+       return (best, None) if self._lane_applied < 0 else (None, best)
+
+   def _near_lane_width(self):
+       """Pinned/learned width of the lane the current offset rides in,
+       or None. Negative offsets ride left of the yellow."""
+       if self._lane_applied < 0:
+           return self.lane_width_l if self.lane_width_l is not None \
+               else self.dist_left
+       return self.lane_width_r if self.lane_width_r is not None \
+           else self.dist_right
+
+   def _update_white_tracker(self, white_pts, w, h, roi_h, now, dt):
+       """
+       Persistent tracker on the lane's NEAR white boundary (see
+       LF_WHITE_TRACK). Matches a cluster to the tracker's own
+       gyro-predicted previous position (ego-frame expectation when the
+       tracker is cold), fits position and heading exactly like the
+       yellow, and EMAs both. Runs every frame while lane-offset
+       driving, tracked or not, so it is already warm when the yellow
+       drops out mid-bend.
+       """
+       if (not self.white_track or abs(self._lane_applied) < 0.25
+               or not white_pts):
+           return
+       width = self._near_lane_width()
+       if width is None:
+           return
+       target = (w / 2.0) if self.target_x is None else float(self.target_x)
+       target_yellow = target - self._lane_applied * float(width)
+       expect = target_yellow - float(width) if self._lane_applied < 0 \
+           else target_yellow + float(width)
+       f_px = (w / 2.0) / np.tan(np.radians(self.cam_hfov) / 2.0)
+       fresh = (self._white_seen is not None
+                and now - self._white_seen <= 0.5)
+       ref = self.white_x_f if fresh and self.white_x_f is not None else expect
+       pred = ref - f_px * self.yaw_rate_f * dt
+       allow = self.white_track_jump * w + abs(f_px * self.yaw_rate_f * dt)
+
+       pts = sorted(white_pts)
+       gap = self.white_cluster_frac * w
+       clusters, cur = [], [pts[0]]
+       for p in pts[1:]:
+           if p[0] - cur[-1][0] > gap:
+               clusters.append(cur)
+               cur = [p]
+           else:
+               cur.append(p)
+       clusters.append(cur)
+       best, best_d = None, allow
+       for cl in clusters:
+           if len(cl) < self.white_min_bands:
+               continue
+           bx = self._cluster_bottom_x(cl, roi_h, w)
+           if abs(bx - pred) < best_d:
+               best, best_d = cl, abs(bx - pred)
+       if best is None:
+           return
+       bx = self._cluster_bottom_x(best, roi_h, w)
+       # Heading of the white fit — the live replacement for the frozen
+       # yellow heading in bends. The vanishing-point correction is
+       # anchored at the white's EXPECTED in-lane position, NOT its
+       # instantaneous bottom projection: in a sharp bend the projection
+       # collapses along the chord (bx read 130px low in session 38's
+       # entrance right-hander), and anchoring there over-subtracts so
+       # hard it FLIPS the lean's sign — the tracker then steered away
+       # from the bend. Anchored at the steady-state position the two
+       # are identical while driving in-lane, and a swept-away white
+       # reads as real lean, which is exactly the steer-with-it signal.
+       heading = None
+       arr = np.array(best, dtype=np.float64)
+       if len(best) >= 2 and np.ptp(arr[:, 1]) > 1e-6:
+           wgt = arr[:, 2] * (0.5 + arr[:, 1] / roi_h)
+           a, _b = np.polyfit(arr[:, 1], arr[:, 0], 1, w=np.sqrt(wgt))
+           vp_x = (w / 2.0) if self.target_x is None else float(self.target_x)
+           a_exp = (expect - vp_x) / max(h * (1.0 - self.vp_y_frac), 1.0)
+           heading = float(np.clip(-(a - a_exp) * roi_h / (w / 2.0), -1.0, 1.0))
+       stale = self._white_seen is None or now - self._white_seen > 0.5
+       if stale or self.white_x_f is None:
+           self.white_x_f = float(bx)
+           self.white_h_f = heading
+       else:
+           self.white_x_f += self._alpha(dt, self.x_tc) * (bx - self.white_x_f)
+           if heading is not None:
+               if self.white_h_f is None:
+                   self.white_h_f = heading
+               else:
+                   self.white_h_f += self._alpha(dt, self.h_tc) \
+                       * (heading - self.white_h_f)
+       self._white_seen = now
+
    # ------------------------------------------------------------------ #
    # control                                                            #
    # ------------------------------------------------------------------ #
@@ -1229,6 +1424,38 @@ class LineFollower:
    def _alpha(self, dt, tc):
        """EMA coefficient for time constant tc at time step dt."""
        return 1.0 if tc <= 0 else 1.0 - float(np.exp(-dt / tc))
+
+   def _heading_cmd(self, hterm, dt, update_slow=True):
+       """
+       Combined heading steering response: kh * hterm plus the slow
+       curve feed-forward (see LF_CURVE_GAIN), floored on sharp leans
+       (see LF_SHARP_BEND_MIN). With update_slow=False the curve state
+       is frozen and excluded — used while steering on a FROZEN heading
+       snapshot (white-guided), where the field-tuned negative curve
+       gain would push against completing the turn.
+       """
+       if update_slow:
+           tc = self.curve_tc
+           if hterm * self.h_slow < 0 or abs(hterm) < 0.5 * abs(self.h_slow):
+               tc = self.curve_tc / 5.0
+           self.h_slow += self._alpha(dt, tc) * (hterm - self.h_slow)
+           cmd = self.kh * hterm + self.curve_gain * self.h_slow
+       else:
+           cmd = self.kh * hterm
+       # The field-tuned negative curve gain may DAMP the heading
+       # response to zero on a sustained lean, but it must never invert
+       # it: session 39 crashed mid-bend when the heading reading dipped
+       # to +0.35 (car locally aligned with the line it sees, bend still
+       # going) — below the sharp-bend floor — and kc*h_slow flipped the
+       # net response to steer-left inside a right-hander. Below 0.15
+       # the lean's sign is noise and the clamp stays out of the way.
+       if abs(hterm) >= 0.15:
+           s = 1.0 if hterm > 0 else -1.0
+           cmd = s * max(s * cmd, 0.0)
+       if abs(hterm) >= 0.9 * self.h_clip and self.sharp_bend_min > 0:
+           s = 1.0 if hterm > 0 else -1.0
+           cmd = s * max(s * cmd, self.sharp_bend_min)
+       return float(cmd)
 
    def _update_filters(self, x, heading, now, dt):
        """EMA the raw measurements before the PID sees them (see the
@@ -1327,20 +1554,28 @@ class LineFollower:
        # straight out of the gate — session 36 lost the yellow for 2s in
        # a bend and coasted to a stop with a valid white in view because
        # the frozen reference no longer matched the scene.
+       # Clamped to 1.5 frame-widths: session 37 integrated the reference
+       # out to x=765 during a spin — and the white-line side split then
+       # rejected every REAL white cluster against that phantom reference
+       # for 2 straight seconds (distance bounds), locking guidance out.
        if not found and self.last_x is not None and self.gyro_gain != 0.0:
            f_px = (w / 2.0) / np.tan(np.radians(self.cam_hfov) / 2.0)
-           self.last_x = float(self.last_x - f_px * self.yaw_rate_f * dt)
+           self.last_x = float(np.clip(
+               self.last_x - f_px * self.yaw_rate_f * dt, -0.5 * w, 1.5 * w))
 
        # a fit that failed the temporal gate is a phantom — never hand it
        # to the white-line side split as the yellow reference
        yellow_fit = debug.get('fit') if found else None
        wl = wr = None
        wl_ok = wr_ok = False
+       roi_h = h - debug['roi_y0']
        if self.white_enabled and debug['white_pts']:
-           roi_h = h - debug['roi_y0']
            wl, wr, wl_ok, wr_ok = self._split_whites(
                debug['white_pts'], yellow_fit, w, roi_h)
            debug['wl'], debug['wr'] = wl, wr
+           # keep the near-white tracker warm every frame (lane-offset
+           # driving) so it can take over the instant the yellow drops
+           self._update_white_tracker(debug['white_pts'], w, h, roi_h, now, dt)
 
        # Ramp the lane offset toward its setpoint once the lane width it
        # needs is available (immediately when LF_LANE_WIDTH_PX is set,
@@ -1399,19 +1634,10 @@ class LineFollower:
            self.prev_error = error
 
 
-           # slow curve feed-forward: sustained lean carries the bend
-           # (see LF_CURVE_GAIN); the fast part stays at kh. Attack is
-           # slow (only a SUSTAINED lean counts as a curve) but release is
-           # fast: when the lean collapses or flips sign the bend is over
-           # — an S-transition holding the old boost for its full time
-           # constant blows the car wide into the new bend.
-           tc = self.curve_tc
-           if hterm * self.h_slow < 0 or abs(hterm) < 0.5 * abs(self.h_slow):
-               tc = self.curve_tc / 5.0
-           self.h_slow += self._alpha(dt, tc) * (hterm - self.h_slow)
-           steer = (self.kp * error + self.kd * self.d_f
-                    + self.i_term + self.kh * hterm
-                    + self.curve_gain * self.h_slow + damp)
+           # heading response = kh*hterm + slow curve feed-forward, with
+           # the sharp-bend floor; see _heading_cmd / LF_SHARP_BEND_MIN
+           steer = (self.kp * error + self.kd * self.d_f + self.i_term
+                    + self._heading_cmd(hterm, dt) + damp)
            self._apply_steering(steer, dt)
 
 
@@ -1429,9 +1655,73 @@ class LineFollower:
        else:
            if self.lost_since is None:
                self.lost_since = now
+           # PRIMARY blind-bend path for lane-offset driving: steer
+           # directly on the live near-white tracker. Unlike the estimate
+           # chain below it needs no yellow reference at all, and its
+           # heading is measured fresh every frame — the car keeps real
+           # heading feedback through the whole arc instead of holding a
+           # frozen snapshot. (Session 38: whites were detected in >92%
+           # of the frames of every episode that ended in a stop; what
+           # failed was inference built on the stale yellow, not vision.)
+           track_w = self._near_lane_width()
+           if (self.white_track and abs(self._lane_applied) >= 0.25
+                   and track_w is not None
+                   and self._white_seen is not None
+                   and now - self._white_seen <= self.white_track_fresh
+                   and now - self.lost_since <= self.white_guide_sec):
+               virtual = self.white_x_f + float(track_w) \
+                   if self._lane_applied < 0 \
+                   else self.white_x_f - float(track_w)
+               hterm = 0.0
+               if self.white_h_f is not None:
+                   hterm = float(np.clip(self.white_h_f - self.h_bias,
+                                         -self.h_clip, self.h_clip))
+               # same chord-bias compensation as the estimate chain —
+               # the white's bottom projection leans into the bend
+               virtual += self.chord_comp * w * hterm
+               self.last_x = float(virtual)
+               self._update_filters(virtual, None, now, dt)
+               error, target = self._steer_error(self.x_f, w)
+               self.last_err = error
+               debug['target'] = target
+               debug['x_est'] = virtual
+               self.prev_error = None
+               self.d_f = 0.0
+               # The sharper the lean, the more the white runs sideways
+               # through the frame and the less its bottom projection
+               # means: at pegged lean the projection collapses along the
+               # chord (session 38 read the white 130px left of reality
+               # in the entrance right-hander, and full-gain P steered
+               # hard AWAY from the bend). Fade the position term out
+               # with lean and let the live heading carry the arc.
+               p_scale = 1.0 - 0.85 * min(abs(hterm) / max(self.h_clip, 1e-6), 1.0)
+               steer = (p_scale * self.kp * error + self.i_term
+                        + self._heading_cmd(hterm, dt) + damp)
+               self._apply_steering(steer, dt)
+               slow = min(1.0, max(abs(self.steering),
+                                   abs(hterm) / max(self.h_clip, 1e-6)))
+               self.throttle = self.th_max - (self.th_max - self.th_min) * slow
+               self.status = "white-tracking"
+               self.lost_frames = 0
+               self._last_guided = now
+               out_img = self._overlay(cam_img, debug, found, 0.0) \
+                   if self.overlay else cam_img
+               return self.steering, self.throttle, out_img
            x_est = None
            if self.white_enabled and now - self.lost_since <= self.white_guide_sec:
+               if wl is None and wr is None and debug['white_pts']:
+                   # reference-based side split found nothing usable —
+                   # fall back to ego-frame identification of the lane's
+                   # near boundary (lane-offset driving only)
+                   wl, wr = self._ego_near_boundary(
+                       debug['white_pts'], w, h - debug['roi_y0'])
                x_est = self._estimate_from_whites(wl, wr)
+               if x_est is not None and self.h_f is not None:
+                   # chord-distortion compensation (LF_WHITE_CHORD_COMP):
+                   # in a bend the white's straight-line bottom projection
+                   # is biased toward the curve's inside
+                   x_est += self.chord_comp * w * float(np.clip(
+                       self.h_f - self.h_bias, -self.h_clip, self.h_clip))
            # Sanity-gate the white estimate against the last known line
            # position: _split_whites sides its clusters off the (possibly
            # stale or misfit) yellow reference, and one wrong-side call
@@ -1465,6 +1755,16 @@ class LineFollower:
                # term across the mode switch — the error source changed.
                # The estimate still feeds the x filter, so the handback to
                # yellow tracking is seamless on both ends.
+               # Follow the estimate with a rate limit instead of jumping
+               # to it: mid-turn white bottom-projections scatter +/-100px
+               # frame to frame (sparse centroids, extrapolation), and a
+               # reference that teleports with each sample whipsaws the
+               # steering — session 37's guided stretches swung the
+               # command full-range at 2-3Hz on exactly that scatter.
+               if self.last_x is not None:
+                   step = 0.08 * w
+                   x_est = float(self.last_x
+                                 + np.clip(x_est - self.last_x, -step, step))
                self.last_x = x_est
                self._update_filters(x_est, None, now, dt)
                error, target = self._steer_error(self.x_f, w)
@@ -1484,13 +1784,17 @@ class LineFollower:
                if self.h_f is not None:
                    hterm = float(np.clip(self.h_f - self.h_bias,
                                          -self.h_clip, self.h_clip))
-               # NO curve term while blind: h_slow is frozen here, and the
-               # field-tuned LF_CURVE_GAIN is negative on this track — fed
-               # with the frozen mid-turn lean it would actively steer
-               # AGAINST completing the turn, which is the last thing a
-               # blind car in a bend needs. kh * hterm alone is the
-               # validated "hold the arc" feed-forward.
-               steer = self.kp * error + self.i_term + self.kh * hterm + damp
+               # update_slow=False: h_slow frozen and the curve term
+               # excluded — fed the frozen mid-turn lean, the field-tuned
+               # negative curve gain would steer against completing the
+               # turn. kh*hterm (plus the sharp-bend floor) holds the arc.
+               # Position de-weighted with lean like the tracker branch:
+               # these estimates come from the same chord-biased bottom
+               # projections.
+               p_scale = 1.0 - 0.85 * min(abs(hterm) / max(self.h_clip, 1e-6), 1.0)
+               steer = (p_scale * self.kp * error + self.i_term
+                        + self._heading_cmd(hterm, dt, update_slow=False)
+                        + damp)
                self._apply_steering(steer, dt)
                self.throttle = self.th_min
                self.status = "white-guided"
@@ -1517,6 +1821,8 @@ class LineFollower:
                    self.x_f = self.h_f = None   # stale after a stop; reseed
                    self.d_f = 0.0
                    self.h_slow = 0.0
+                   self.white_x_f = self.white_h_f = None
+                   self._white_seen = None
                    self._lane_applied = 0.0     # re-ramp the lane offset too
                    self.status = "stopped (line lost)"
                else:
